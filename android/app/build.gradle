@@ -1,0 +1,76 @@
+plugins {
+    id "com.android.application"
+    id 'com.google.gms.google-services'
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"  // Flutter Gradle Plugin must be applied after others
+}
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('key.properties')
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+android {
+    namespace = "com.nubiarabo.taxpal"
+    compileSdk = 35  // Keep the same compile SDK version
+
+    defaultConfig {
+        applicationId "com.nubiarabo.taxpal" // Ensure this matches your namespace
+        minSdk = 23  // Minimum SDK
+        targetSdk = 34  // Target SDK
+        versionCode = 1
+        versionName = "1.0"
+    }
+    signingConfigs {
+        release {
+            keyAlias = keystoreProperties['keyAlias']
+            keyPassword = keystoreProperties['keyPassword']
+            storeFile = keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
+            storePassword = keystoreProperties['storePassword']
+        }
+    }
+    buildTypes {
+        release {
+            // Enable shrinking for release builds
+            minifyEnabled true  // Enables code shrinking (required for shrinking resources)
+            shrinkResources true  // Enables resource shrinking
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            signingConfig = signingConfigs.debug
+            signingConfig = signingConfigs.release
+        }
+
+        debug {
+            // Disable shrinking in debug builds
+            minifyEnabled false  // Disable code shrinking in debug mode
+            shrinkResources false  // Disable resource shrinking in debug mode
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17 // Change this
+                targetCompatibility JavaVersion.VERSION_17 // Change this
+                coreLibraryDesugaringEnabled true
+    }
+
+    kotlinOptions {
+        jvmTarget = "17" // Update this too if you're using Kotlin
+    }
+}
+
+dependencies {
+    implementation platform('com.google.firebase:firebase-bom:33.12.0')
+
+    implementation 'com.google.firebase:firebase-analytics'
+    implementation 'com.google.firebase:firebase-auth'
+    implementation'com.google.android.gms:play-services-auth:21.3.0'
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+}
+
+
+// Add any other Firebase services you need
+
+apply plugin: 'com.google.gms.google-services'
+
+
+flutter {
+    source = "../.."
+}

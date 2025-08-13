@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "425676843416",
+    "project_id": "taxpal-5608a",
+    "storage_bucket": "taxpal-5608a.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:425676843416:android:1e548e9e224d2b2af4e3ed",
+        "android_client_info": {
+          "package_name": "com.nubiarabo.taxpal"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDpUS_qWbC0KZdL9Vtr2HHLkgrfB79vg5k"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
