@@ -11,6 +11,7 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 class ChatScreen extends StatefulWidget {
   final VoidCallback? toggleDrawer;
@@ -21,137 +22,71 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
-  bool isDrawerOpen = false; // Track the drawer state
-  // ----------------------------------
-  // State / Models
-  // ----------------------------------
-  var resultText = 'Results to be shown here...';
+  bool isDrawerOpen = false;
+
+  // Chat state
   final List<ChatMessage> messages = [];
+  final ChatUser user = ChatUser(id: '1', firstName: 'You');
+  final ChatUser bot = ChatUser(id: '2', firstName: 'Iccountant');
 
-  final ChatUser user = ChatUser(id: '1', firstName: 'Hamza', lastName: 'Asif');
-  final ChatUser openAIUser = ChatUser(
-    id: '2',
-    firstName: 'Tax',
-    lastName: 'Pal',
-  );
-
-  /// OpenAI-style rolling history
-  final List<Map<String, Object>> chatHistory = [
+  /// System prompt is neutral; the backend (and ChatService) handle transaction-first logic.
+  final List<Map<String, dynamic>> chatHistory = <Map<String, dynamic>>[
     {
       "role": "system",
-      "content": """
-You are a certified Nigerian tax consultant trained in line with the Institute of Chartered Accountants of Nigeria (ICAN) guidelines. Always give practical, compliant Nigerian tax guidance in clear English (or Nigerian Pidgin if asked).""",
+      "content":
+          "You are a concise assistant. When users ask general questions, answer helpfully and briefly.",
     },
   ];
 
-  // ----------------------------------
-  // Services / Controllers
-  // ----------------------------------
+  // Services / controllers
   final FlutterTts flutterTts = FlutterTts();
   final TextEditingController inputCon = TextEditingController();
   final SpeechToText _speechToText = SpeechToText();
   final ImagePicker _picker = ImagePicker();
   final FlutterSecureStorage _storage = const FlutterSecureStorage();
-  late ChatService chatService;
+  ChatService? chatService;
 
-  // ----------------------------------
-  // Feature Flags
-  // ----------------------------------
+  bool isListening = false;
   bool isTTS = false;
+  bool _ready = false;
 
-  // ----------------------------------
-  // Pending attachments (pre-send)
-  // ----------------------------------
-  /// All selected (but not yet sent) images.
-  /// We support adding from gallery (multi) and camera (single add).
+  // Pending images before sending
   final List<XFile> _pendingImages = [];
 
-  // ----------------------------------
-  // Lifecycle
-  // ----------------------------------
   @override
   void initState() {
     super.initState();
-    _secureKey();
-    _ttsSettings();
-    _initSpeech();
+    _bootstrap();
   }
 
-  // ----------------------------------
-  // Secure Key bootstrap (replace "" w/ real key)
-  // ----------------------------------
-  Future<void> _secureKey() async {
-    await _storage.write(key: "id1", value: ""); // <-- put your API key here
-    _loadKey();
+  Future<void> _bootstrap() async {
+    // Dev key bootstrap (don’t ship a real key in production)
+    await _storage.write(
+      key: "id1",
+      value:
+          "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",
+    );
+    final k = await _storage.read(key: "id1");
+    chatService = ChatService(k);
+    await _initSpeech();
+    await _ttsSettings();
+    setState(() => _ready = true);
   }
 
-  Future<void> _loadKey() async {
-    final String? value = await _storage.read(key: "id1");
-    if (value != null) {
-      chatService = ChatService(value);
-    }
-  }
-
-  // ----------------------------------
-  // Speech
-  // ----------------------------------
   Future<void> _initSpeech() async {
-    await _speechToText.initialize();
-    setState(() {}); // reflect availability if you want to show UI state
-  }
-
-  bool isListening = false;
-  Future<void> _startListening() async {
-    if (isListening) {
-      await _speechToText.stop();
-      setState(() => isListening = false);
-      return;
-    }
-
-    final bool available = await _speechToText.initialize(
-      onStatus: (status) {
-        if (status == "done" || status == "notListening") {
+    await _speechToText.initialize(
+      onStatus: (s) {
+        if (s == "done" || s == "notListening") {
           setState(() => isListening = false);
         }
       },
-      onError: (error) {
-        debugPrint("Speech error: $error");
+      onError: (e) {
+        debugPrint("Speech error: $e");
         setState(() => isListening = false);
       },
     );
-
-    if (available) {
-      setState(() => isListening = true);
-      await _speechToText.listen(
-        onResult: _onSpeechResult,
-        listenMode: ListenMode.dictation,
-        partialResults: true,
-        cancelOnError: true,
-      );
-    } else {
-      debugPrint("Speech not available");
-    }
   }
 
-  Future<void> _stopListening() async {
-    await _speechToText.stop();
-    setState(() {});
-  }
-
-  void _onSpeechResult(SpeechRecognitionResult result) {
-    setState(() {
-      inputCon.text = result.recognizedWords;
-    });
-
-    if (result.finalResult) {
-      _speechToText.stop();
-      setState(() => isListening = false);
-    }
-  }
-
-  // ----------------------------------
-  // TTS
-  // ----------------------------------
   Future<void> _ttsSettings() async {
     if (await flutterTts.isLanguageAvailable("en-US")) {
       await flutterTts.setLanguage("en-US");
@@ -162,33 +97,55 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
     }
   }
 
-  // ----------------------------------
-  // Attachments: Image Selection
-  // ----------------------------------
-  /// Pick *multiple* from gallery.
+  // ===== Speech handlers
+  Future<void> _startListening() async {
+    if (isListening) {
+      await _speechToText.stop();
+      setState(() => isListening = false);
+      return;
+    }
+    final available = await _speechToText.initialize();
+    if (!available) return;
+    setState(() => isListening = true);
+    await _speechToText.listen(
+      onResult: _onSpeechResult,
+      listenMode: ListenMode.dictation,
+      partialResults: true,
+      cancelOnError: true,
+    );
+  }
+
+  void _onSpeechResult(SpeechRecognitionResult r) {
+    setState(() {
+      inputCon.text = r.recognizedWords;
+    });
+    if (r.finalResult) {
+      _speechToText.stop();
+      setState(() => isListening = false);
+    }
+  }
+
+  // ===== Attachments
   Future<void> _pickImagesFromGallery() async {
-    final List<XFile> picks = await _picker.pickMultiImage();
+    final picks = await _picker.pickMultiImage();
     if (picks.isEmpty) return;
     _pendingImages.addAll(picks);
     setState(() {});
   }
 
-  /// Capture single image, append to pending list.
   Future<void> _captureImageCamera() async {
-    final XFile? shot = await _picker.pickImage(source: ImageSource.camera);
+    final shot = await _picker.pickImage(source: ImageSource.camera);
     if (shot == null) return;
     _pendingImages.add(shot);
     setState(() {});
   }
 
-  /// Remove image at index from pending list.
-  void _removePendingImage(int idx) {
-    if (idx < 0 || idx >= _pendingImages.length) return;
-    _pendingImages.removeAt(idx);
+  void _removePendingImage(int i) {
+    if (i < 0 || i >= _pendingImages.length) return;
+    _pendingImages.removeAt(i);
     setState(() {});
   }
 
-  /// Build horizontal preview row (ChatGPT-style).
   Widget _buildPendingPreviewRow() {
     if (_pendingImages.isEmpty) return const SizedBox.shrink();
     return SizedBox(
@@ -238,59 +195,16 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
     );
   }
 
-  // ----------------------------------
-  // Audio Attach (unchanged)
-  // ----------------------------------
-  Future<void> _selectAudio() async {
-    final FilePickerResult? result = await FilePicker.platform.pickFiles(
-      type: FileType.audio,
-    );
-    if (result == null) return;
+  // ===== Chat send flow (conversational + interactive)
+  Future<void> _handleSubmit() async {
+    if (!_ready || chatService == null) return;
 
-    // Show user audio file message
-    messages.insert(
-      0,
-      ChatMessage(
-        text: "",
-        createdAt: DateTime.now(),
-        user: user,
-        medias: [
-          ChatMedia(
-            url: result.files.first.path!,
-            fileName: result.files.first.name,
-            type: MediaType.file,
-          ),
-        ],
-      ),
-    );
-    setState(() {});
-
-    // Convert to text (server side)
-    resultText = await chatService.audioToText(result.files.first.path!);
-
-    // Show AI transcription
-    messages.insert(
-      0,
-      ChatMessage(
-        text: resultText,
-        createdAt: DateTime.now(),
-        user: openAIUser,
-      ),
-    );
-    setState(() {});
-  }
-
-  // ----------------------------------
-  // Send to AI
-  // ----------------------------------
-  Future<void> _askChatGPT() async {
-    final String prompt = inputCon.text.trim();
-    final bool hasImages = _pendingImages.isNotEmpty;
-    final bool hasText = prompt.isNotEmpty;
-
+    final prompt = inputCon.text.trim();
+    final hasImages = _pendingImages.isNotEmpty;
+    final hasText = prompt.isNotEmpty;
     if (!hasImages && !hasText) return;
 
-    // 1. Show user message in chat (text + medias)
+    // 1) Show user message
     List<ChatMedia>? medias;
     if (hasImages) {
       medias =
@@ -304,107 +218,87 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
               )
               .toList();
     }
-    messages.insert(
-      0,
-      ChatMessage(
-        text: prompt, // may be ""
-        createdAt: DateTime.now(),
-        user: user,
-        medias: medias,
-      ),
+    final userMsg = ChatMessage(
+      text: prompt,
+      createdAt: DateTime.now(),
+      user: user,
+      medias: medias,
     );
+    messages.insert(0, userMsg);
+    await _saveChatMessage(prompt, medias);
+
     setState(() {});
-
-    // 2. Push into chatHistory (OpenAI input format)
-    if (hasImages) {
-      // Build content array of image objects + optional text
-      final List<Object> contentBlocks =
-          _pendingImages
-              .map(
-                (x) => {
-                  "type": "image_url",
-                  "image_url": {
-                    "url":
-                        "data:image/jpeg;base64,${base64Encode(File(x.path).readAsBytesSync())}",
-                  },
-                },
-              )
-              .toList();
-
-      if (hasText) {
-        contentBlocks.add({"type": "text", "text": prompt});
-      }
-
-      chatHistory.add({"role": "user", "content": contentBlocks});
-    } else if (hasText) {
-      chatHistory.add({"role": "user", "content": prompt});
-    }
-
-    // 3. Clear user input + previews
     inputCon.clear();
     _pendingImages.clear();
-    setState(() {});
 
-    // 4. Call model
-    resultText = await chatService.askChatGPT(chatHistory);
+    // 2) Ask the service (transaction-first). If info is missing,
+    //    the service/backend will *ask in chat* (e.g., ask for date or account type).
+    String reply;
+    try {
+      reply = await chatService!.handlePrompt(chatHistory, prompt);
+    } catch (e) {
+      reply = "There was a problem: $e";
+    }
 
-    // 5. TTS (optional)
-    if (isTTS) await flutterTts.speak(resultText);
-
-    // 6. Append assistant in history & chat
-    chatHistory.add({"role": "assistant", "content": resultText});
-    messages.insert(
-      0,
-      ChatMessage(
-        text: resultText,
-        createdAt: DateTime.now(),
-        user: openAIUser,
-      ),
+    // 3) Show bot message (could be confirmation or a follow-up question)
+    final botMsg = ChatMessage(
+      text: reply,
+      createdAt: DateTime.now(),
+      user: bot,
     );
+    messages.insert(0, botMsg);
     setState(() {});
+
+    // Optional TTS
+    if (isTTS && reply.isNotEmpty) {
+      await flutterTts.speak(reply);
+    }
   }
 
-  // ----------------------------------
-  // Generate Images (prompt → DALL·E / etc.)
-  // ----------------------------------
+  // ===== Persist chat list locally (simple log)
+  Future<void> _saveChatMessage(String message, List<ChatMedia>? medias) async {
+    final chatMessage = {
+      'text': message,
+      'createdAt': DateTime.now().toString(),
+      'user': 'user',
+      'media': medias?.map((e) => e.url).toList(),
+    };
+
+    final prefs = await SharedPreferences.getInstance();
+    final messagesList = prefs.getStringList('chatHistory') ?? [];
+    messagesList.add(jsonEncode(chatMessage));
+    await prefs.setStringList('chatHistory', messagesList);
+  }
+
+  // ===== Image generation (unchanged)
   Future<void> _generateImages() async {
-    final String prompt = inputCon.text;
-    if (prompt.trim().isEmpty) return;
+    if (chatService == null) return;
+    final String prompt = inputCon.text.trim();
+    if (prompt.isEmpty) return;
 
     messages.insert(
       0,
       ChatMessage(text: prompt, createdAt: DateTime.now(), user: user),
     );
     setState(() {});
-
     inputCon.clear();
 
-    final List<String> imageUrls = await chatService.generateImages(prompt);
-    final List<ChatMedia> genImages =
-        imageUrls
+    final urls = await chatService!.generateImages(prompt);
+    final medias =
+        urls
             .map(
-              (item) => ChatMedia(
-                url: item,
-                fileName: "image",
-                type: MediaType.image,
-              ),
+              (u) =>
+                  ChatMedia(url: u, fileName: "image", type: MediaType.image),
             )
             .toList();
 
     messages.insert(
       0,
-      ChatMessage(
-        createdAt: DateTime.now(),
-        user: openAIUser,
-        medias: genImages,
-      ),
+      ChatMessage(createdAt: DateTime.now(), user: bot, medias: medias),
     );
     setState(() {});
   }
 
-  // ----------------------------------
-  // Bottom sheet: choose source (like ChatGPT)
-  // ----------------------------------
   void _showAttachSheet() {
     showModalBottomSheet(
       context: context,
@@ -462,24 +356,21 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
     );
   }
 
-  // ----------------------------------
-  // Build
-  // ----------------------------------
+  // ===== UI
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Column(
         children: [
-          // Drawer (Top Drawer)
+          // Top drawer
           AnimatedContainer(
             duration: const Duration(milliseconds: 300),
-            height:
-                isDrawerOpen ? 600 : 60, // Height changes based on drawer state
+            height: isDrawerOpen ? 600 : 60,
             decoration: BoxDecoration(
-              color: Colors.white, // Use color inside BoxDecoration
+              color: Colors.white,
               border: Border(
                 bottom: BorderSide(
-                  color: Colors.grey.withOpacity(0.3), // Light grey border
+                  color: Colors.grey.withOpacity(0.3),
                   width: 1,
                 ),
               ),
@@ -487,11 +378,7 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
             child: Column(
               children: [
                 GestureDetector(
-                  onTap: () {
-                    setState(() {
-                      isDrawerOpen = !isDrawerOpen;
-                    });
-                  },
+                  onTap: () => setState(() => isDrawerOpen = !isDrawerOpen),
                   child: ListTile(
                     title: Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -510,8 +397,7 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
                     ),
                   ),
                 ),
-                if (isDrawerOpen) ...[
-                  // Content of the drawer when open
+                if (isDrawerOpen)
                   Container(
                     padding: const EdgeInsets.all(8.0),
                     child: const Text(
@@ -519,7 +405,6 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
                       style: TextStyle(color: Colors.black),
                     ),
                   ),
-                ],
               ],
             ),
           ),
@@ -546,7 +431,7 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
             ),
           ),
 
-          // Pending attachments row
+          // Pending attachments preview
           _buildPendingPreviewRow(),
 
           // Input Bar
@@ -556,10 +441,10 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
     );
   }
 
-  // ----------------------------------
-  // Input Card Widget
-  // ----------------------------------
   Widget _buildInputCard() {
+    final canSend =
+        _ready &&
+        (inputCon.text.trim().isNotEmpty || _pendingImages.isNotEmpty);
     return Card(
       color: Colors.white,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
@@ -567,8 +452,7 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
         child: Row(
-          crossAxisAlignment:
-              CrossAxisAlignment.center, // Align icons on the same line
+          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             IconButton(
               icon: const Icon(Icons.attach_file_sharp, color: Colors.black),
@@ -576,9 +460,7 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
             ),
             Expanded(
               child: ConstrainedBox(
-                constraints: const BoxConstraints(
-                  maxHeight: 120, // roughly 5 lines
-                ),
+                constraints: const BoxConstraints(maxHeight: 120),
                 child: Scrollbar(
                   thumbVisibility: true,
                   child: SingleChildScrollView(
@@ -586,18 +468,15 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
                     reverse: true,
                     child: TextField(
                       controller: inputCon,
-                      maxLines: null, // expands vertically
+                      maxLines: null,
                       minLines: 1,
                       keyboardType: TextInputType.multiline,
                       decoration: const InputDecoration(
                         border: InputBorder.none,
-                        hintText: 'Type here...',
+                        hintText:
+                            'Type here… e.g., “sales 5000”, “capital 100000 today”, or “date 2025-08-15”',
                       ),
-                      onChanged: (text) {
-                        setState(() {
-                          // Trigger rebuild to check if text is entered
-                        });
-                      },
+                      onChanged: (_) => setState(() {}),
                       onSubmitted: (_) => _handleSubmit(),
                     ),
                   ),
@@ -606,62 +485,30 @@ You are a certified Nigerian tax consultant trained in line with the Institute o
             ),
             IconButton(
               icon: Icon(
-                isListening
-                    ? UniconsLine
-                        .stop_circle // UniIcon for stop circle
-                    : UniconsLine.microphone, // UniIcon for microphone
+                isListening ? UniconsLine.stop_circle : UniconsLine.microphone,
                 color: isListening ? Colors.red : Colors.black54,
               ),
-              iconSize:
-                  20, // Set the icon size (default is 24, adjust as needed)
+              iconSize: 20,
               onPressed: _startListening,
             ),
-
-            // Replace the arrow icon with UniIcon and make it unclickable when no text or image
             IconButton(
               icon: Container(
                 decoration: BoxDecoration(
-                  color:
-                      inputCon.text.isEmpty
-                          ? Colors.grey[300]
-                          : Colors
-                              .black, // Light grey when empty, black when text is present
-                  shape: BoxShape.circle, // Makes the container a circle
+                  color: canSend ? Colors.black : Colors.grey[300],
+                  shape: BoxShape.circle,
                 ),
-                padding: const EdgeInsets.all(
-                  8,
-                ), // Padding to make the circle size bigger
+                padding: const EdgeInsets.all(8),
                 child: Icon(
-                  UniconsLine
-                      .arrow_up, // Correct UniconsLine icon for "up" arrow
-                  color:
-                      inputCon.text.isEmpty
-                          ? Colors.grey
-                          : Colors
-                              .white, // Dim color when empty, white when active
-                  size: 25, // Increase the icon size
+                  UniconsLine.arrow_up,
+                  color: canSend ? Colors.white : Colors.grey,
+                  size: 25,
                 ),
               ),
-              onPressed:
-                  inputCon.text.isEmpty
-                      ? null
-                      : _handleSubmit, // Disable if empty
+              onPressed: canSend ? _handleSubmit : null,
             ),
           ],
         ),
       ),
     );
-  }
-
-  // ----------------------------------
-  // Unified submit dispatcher
-  // ----------------------------------
-  void _handleSubmit() {
-    final txt = inputCon.text.toLowerCase();
-    if (txt.startsWith("generate image")) {
-      _generateImages();
-    } else {
-      _askChatGPT();
-    }
   }
 }
