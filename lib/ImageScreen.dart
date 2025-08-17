@@ -1,13 +1,12 @@
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:image_gallery_saver/image_gallery_saver.dart';
 
 class ImageScreen extends StatefulWidget {
   String url;
-  ImageScreen(this.url);
+  ImageScreen(this.url, {super.key});
 
   @override
   State<ImageScreen> createState() => _ImageScreenState();
@@ -16,7 +15,7 @@ class ImageScreen extends StatefulWidget {
 class _ImageScreenState extends State<ImageScreen> {
   _saveNetworkImage() async {
     var response = await Dio().get(
-      this.widget.url,
+      widget.url,
       options: Options(responseType: ResponseType.bytes),
     );
     final result = await ImageGallerySaver.saveImage(
@@ -53,7 +52,7 @@ class _ImageScreenState extends State<ImageScreen> {
       ),
       body: Center(
         child: Image.network(
-          this.widget.url,
+          widget.url,
           width: MediaQuery.of(context).size.width,
           fit: BoxFit.fill,
         ),

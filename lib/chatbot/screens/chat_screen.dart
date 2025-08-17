@@ -1,17 +1,25 @@
+// lib/chat_screen.dart
 import 'dart:convert';
 import 'dart:io';
-import 'package:unicons/unicons.dart';
-import 'package:taxpal/ChatService.dart';
-import 'package:taxpal/ImageScreen.dart';
+
 import 'package:dash_chat_2/dash_chat_2.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:unicons/unicons.dart';
+
+import 'package:taxpal/ChatService.dart';
+import 'package:taxpal/ImageScreen.dart';
+
+// NEW: accounting screens opened from the Iccountant drawer
+import 'package:taxpal/screens/trial_balance_screen.dart';
+import 'package:taxpal/screens/journals_screen.dart';
+import 'package:taxpal/screens/accounts_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   final VoidCallback? toggleDrawer;
@@ -29,7 +37,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final ChatUser user = ChatUser(id: '1', firstName: 'You');
   final ChatUser bot = ChatUser(id: '2', firstName: 'Iccountant');
 
-  /// System prompt is neutral; the backend (and ChatService) handle transaction-first logic.
+  /// System prompt (kept simple; your backend does the accounting smarts)
   final List<Map<String, dynamic>> chatHistory = <Map<String, dynamic>>[
     {
       "role": "system",
@@ -50,7 +58,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool isTTS = false;
   bool _ready = false;
 
-  // Pending images before sending
+  // Pending images before sending (display only; backend doesn’t use yet)
   final List<XFile> _pendingImages = [];
 
   @override
@@ -60,14 +68,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _bootstrap() async {
-    // Dev key bootstrap (don’t ship a real key in production)
-    await _storage.write(
-      key: "id1",
-      value:
-          "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",
-    );
-    final k = await _storage.read(key: "id1");
+    // TIP: don’t pass an OpenAI key while you debug backend connectivity.
+    // If you *do* store one, ChatService will fallback to generic chat when
+    // the backend is unreachable, which can hide network/CORS issues.
+    // await _storage.write(key: "id1", value: "<YOUR_OPENAI_KEY>");
+    // final k = await _storage.read(key: "id1");
+    const String? k = null; // disable fallback chat during dev
     chatService = ChatService(k);
+
     await _initSpeech();
     await _ttsSettings();
     setState(() => _ready = true);
@@ -195,7 +203,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // ===== Chat send flow (conversational + interactive)
+  // ===== Chat send flow
   Future<void> _handleSubmit() async {
     if (!_ready || chatService == null) return;
 
@@ -231,8 +239,7 @@ class _ChatScreenState extends State<ChatScreen> {
     inputCon.clear();
     _pendingImages.clear();
 
-    // 2) Ask the service (transaction-first). If info is missing,
-    //    the service/backend will *ask in chat* (e.g., ask for date or account type).
+    // 2) Ask service (hits FastAPI /prompt). If unclear, it returns a clarifying message.
     String reply;
     try {
       reply = await chatService!.handlePrompt(chatHistory, prompt);
@@ -240,7 +247,7 @@ class _ChatScreenState extends State<ChatScreen> {
       reply = "There was a problem: $e";
     }
 
-    // 3) Show bot message (could be confirmation or a follow-up question)
+    // 3) Show bot message
     final botMsg = ChatMessage(
       text: reply,
       createdAt: DateTime.now(),
@@ -270,7 +277,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await prefs.setStringList('chatHistory', messagesList);
   }
 
-  // ===== Image generation (unchanged)
+  // ===== Image generation (optional)
   Future<void> _generateImages() async {
     if (chatService == null) return;
     final String prompt = inputCon.text.trim();
@@ -362,7 +369,7 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       body: Column(
         children: [
-          // Top drawer
+          // Top Iccountant drawer (collapsible)
           AnimatedContainer(
             duration: const Duration(milliseconds: 300),
             height: isDrawerOpen ? 600 : 60,
@@ -398,11 +405,81 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
                 if (isDrawerOpen)
-                  Container(
-                    padding: const EdgeInsets.all(8.0),
-                    child: const Text(
-                      'Drawer Content Here',
-                      style: TextStyle(color: Colors.black),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.fromLTRB(12, 4, 12, 8),
+                          child: Text(
+                            'Iccountant • Accounts & Reports',
+                            style: TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        Card(
+                          elevation: 0,
+                          color: Colors.grey.shade50,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Column(
+                            children: [
+                              ListTile(
+                                leading: const Icon(Icons.balance),
+                                title: const Text('Trial Balance'),
+                                subtitle: const Text(
+                                  'Debits & Credits by account',
+                                ),
+                                onTap: () {
+                                  setState(() => isDrawerOpen = false);
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder:
+                                          (_) => const TrialBalanceScreen(),
+                                    ),
+                                  );
+                                },
+                              ),
+                              const Divider(height: 1),
+                              ListTile(
+                                leading: const Icon(Icons.list_alt),
+                                title: const Text('Journals'),
+                                subtitle: const Text('Posted entries & lines'),
+                                onTap: () {
+                                  setState(() => isDrawerOpen = false);
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => const JournalsScreen(),
+                                    ),
+                                  );
+                                },
+                              ),
+                              const Divider(height: 1),
+                              ListTile(
+                                leading: const Icon(Icons.account_tree),
+                                title: const Text('Chart of Accounts'),
+                                subtitle: const Text(
+                                  'All accounts in your CoA',
+                                ),
+                                onTap: () {
+                                  setState(() => isDrawerOpen = false);
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                      builder: (_) => const AccountsScreen(),
+                                    ),
+                                  );
+                                },
+                              ),
+                              const SizedBox(height: 8),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
                     ),
                   ),
               ],
@@ -474,7 +551,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       decoration: const InputDecoration(
                         border: InputBorder.none,
                         hintText:
-                            'Type here… e.g., “sales 5000”, “capital 100000 today”, or “date 2025-08-15”',
+                            'Type here… e.g., “Paid ₦50,000 rent via GTBank” or “Sold goods ₦600,000, VAT 7.5%”',
                       ),
                       onChanged: (_) => setState(() {}),
                       onSubmitted: (_) => _handleSubmit(),
