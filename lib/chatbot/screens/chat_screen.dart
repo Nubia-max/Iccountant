@@ -13,13 +13,12 @@ import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:unicons/unicons.dart';
 
-import 'package:taxpal/ChatService.dart';
-import 'package:taxpal/ImageScreen.dart';
+// Adjust path if your file lives elsewhere
+import 'package:taxpal/chatbot/service/ChatService.dart';
+import 'package:taxpal/chatbot/screens/ImageScreen.dart';
 
-// NEW: accounting screens opened from the Iccountant drawer
-import 'package:taxpal/screens/trial_balance_screen.dart';
-import 'package:taxpal/screens/journals_screen.dart';
-import 'package:taxpal/screens/accounts_screen.dart';
+// New drawer widget (below)
+import 'package:taxpal/widgets/iccountant_drawer.dart';
 
 class ChatScreen extends StatefulWidget {
   final VoidCallback? toggleDrawer;
@@ -37,7 +36,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final ChatUser user = ChatUser(id: '1', firstName: 'You');
   final ChatUser bot = ChatUser(id: '2', firstName: 'Iccountant');
 
-  /// System prompt (kept simple; your backend does the accounting smarts)
+  /// System prompt (kept simple; backend handles accounting)
   final List<Map<String, dynamic>> chatHistory = <Map<String, dynamic>>[
     {
       "role": "system",
@@ -58,7 +57,7 @@ class _ChatScreenState extends State<ChatScreen> {
   bool isTTS = false;
   bool _ready = false;
 
-  // Pending images before sending (display only; backend doesn’t use yet)
+  // Pending images before sending (display only)
   final List<XFile> _pendingImages = [];
 
   @override
@@ -68,17 +67,42 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _bootstrap() async {
-    // TIP: don’t pass an OpenAI key while you debug backend connectivity.
-    // If you *do* store one, ChatService will fallback to generic chat when
-    // the backend is unreachable, which can hide network/CORS issues.
-    // await _storage.write(key: "id1", value: "<YOUR_OPENAI_KEY>");
-    // final k = await _storage.read(key: "id1");
-    const String? k = null; // disable fallback chat during dev
-    chatService = ChatService(k);
+    // Create service. API base can be passed via --dart-define=API_BASE=...
+    chatService = ChatService(
+      apiBase: const String.fromEnvironment('API_BASE', defaultValue: ''),
+    );
 
     await _initSpeech();
     await _ttsSettings();
     setState(() => _ready = true);
+    await _loadHistoryFromBackend();
+  }
+
+  Future<void> _loadHistoryFromBackend() async {
+    if (chatService == null) return;
+    try {
+      final convId = await chatService!.ensureActiveConversation();
+      if (convId == null) return;
+      final backendMsgs = await chatService!.fetchMessages(convId);
+      // Convert maps -> DashChat messages (newest first)
+      final converted =
+          backendMsgs.map((m) {
+            final role = (m['role'] ?? '').toString();
+            final text = (m['content'] ?? '').toString();
+            final createdStr = (m['created_at'] ?? '').toString();
+            final created = DateTime.tryParse(createdStr) ?? DateTime.now();
+            final who = role == 'user' ? user : bot;
+            return ChatMessage(text: text, createdAt: created, user: who);
+          }).toList();
+
+      setState(() {
+        messages
+          ..clear()
+          ..addAll(converted.reversed);
+      });
+    } catch (e) {
+      debugPrint('History load error: $e');
+    }
   }
 
   Future<void> _initSpeech() async {
@@ -124,16 +148,14 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _onSpeechResult(SpeechRecognitionResult r) {
-    setState(() {
-      inputCon.text = r.recognizedWords;
-    });
+    setState(() => inputCon.text = r.recognizedWords);
     if (r.finalResult) {
       _speechToText.stop();
       setState(() => isListening = false);
     }
   }
 
-  // ===== Attachments
+  // ===== Attachments (UI-only for now)
   Future<void> _pickImagesFromGallery() async {
     final picks = await _picker.pickMultiImage();
     if (picks.isEmpty) return;
@@ -212,7 +234,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final hasText = prompt.isNotEmpty;
     if (!hasImages && !hasText) return;
 
-    // 1) Show user message
+    // 1) Show user message immediately
     List<ChatMedia>? medias;
     if (hasImages) {
       medias =
@@ -234,20 +256,20 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     messages.insert(0, userMsg);
     await _saveChatMessage(prompt, medias);
-
     setState(() {});
     inputCon.clear();
     _pendingImages.clear();
 
-    // 2) Ask service (hits FastAPI /prompt). If unclear, it returns a clarifying message.
+    // 2) Ask backend (/chat2). The backend persists everything.
     String reply;
     try {
       reply = await chatService!.handlePrompt(chatHistory, prompt);
     } catch (e) {
       reply = "There was a problem: $e";
+      debugPrint(e.toString());
     }
 
-    // 3) Show bot message
+    // 3) Show assistant reply
     final botMsg = ChatMessage(
       text: reply,
       createdAt: DateTime.now(),
@@ -262,7 +284,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  // ===== Persist chat list locally (simple log)
+  // ===== Local log (backend is source of truth)
   Future<void> _saveChatMessage(String message, List<ChatMedia>? medias) async {
     final chatMessage = {
       'text': message,
@@ -275,35 +297,6 @@ class _ChatScreenState extends State<ChatScreen> {
     final messagesList = prefs.getStringList('chatHistory') ?? [];
     messagesList.add(jsonEncode(chatMessage));
     await prefs.setStringList('chatHistory', messagesList);
-  }
-
-  // ===== Image generation (optional)
-  Future<void> _generateImages() async {
-    if (chatService == null) return;
-    final String prompt = inputCon.text.trim();
-    if (prompt.isEmpty) return;
-
-    messages.insert(
-      0,
-      ChatMessage(text: prompt, createdAt: DateTime.now(), user: user),
-    );
-    setState(() {});
-    inputCon.clear();
-
-    final urls = await chatService!.generateImages(prompt);
-    final medias =
-        urls
-            .map(
-              (u) =>
-                  ChatMedia(url: u, fileName: "image", type: MediaType.image),
-            )
-            .toList();
-
-    messages.insert(
-      0,
-      ChatMessage(createdAt: DateTime.now(), user: bot, medias: medias),
-    );
-    setState(() {});
   }
 
   void _showAttachSheet() {
@@ -405,82 +398,12 @@ class _ChatScreenState extends State<ChatScreen> {
                   ),
                 ),
                 if (isDrawerOpen)
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8.0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Padding(
-                          padding: EdgeInsets.fromLTRB(12, 4, 12, 8),
-                          child: Text(
-                            'Iccountant • Accounts & Reports',
-                            style: TextStyle(fontWeight: FontWeight.w600),
-                          ),
-                        ),
-                        Card(
-                          elevation: 0,
-                          color: Colors.grey.shade50,
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
-                          child: Column(
-                            children: [
-                              ListTile(
-                                leading: const Icon(Icons.balance),
-                                title: const Text('Trial Balance'),
-                                subtitle: const Text(
-                                  'Debits & Credits by account',
-                                ),
-                                onTap: () {
-                                  setState(() => isDrawerOpen = false);
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder:
-                                          (_) => const TrialBalanceScreen(),
-                                    ),
-                                  );
-                                },
-                              ),
-                              const Divider(height: 1),
-                              ListTile(
-                                leading: const Icon(Icons.list_alt),
-                                title: const Text('Journals'),
-                                subtitle: const Text('Posted entries & lines'),
-                                onTap: () {
-                                  setState(() => isDrawerOpen = false);
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => const JournalsScreen(),
-                                    ),
-                                  );
-                                },
-                              ),
-                              const Divider(height: 1),
-                              ListTile(
-                                leading: const Icon(Icons.account_tree),
-                                title: const Text('Chart of Accounts'),
-                                subtitle: const Text(
-                                  'All accounts in your CoA',
-                                ),
-                                onTap: () {
-                                  setState(() => isDrawerOpen = false);
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) => const AccountsScreen(),
-                                    ),
-                                  );
-                                },
-                              ),
-                              const SizedBox(height: 8),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                      ],
-                    ),
+                  SizedBox(
+                    height: 540,
+                    child:
+                        chatService == null
+                            ? const Center(child: CircularProgressIndicator())
+                            : IccountantDrawer(chatService: chatService!),
                   ),
               ],
             ),
@@ -551,7 +474,7 @@ class _ChatScreenState extends State<ChatScreen> {
                       decoration: const InputDecoration(
                         border: InputBorder.none,
                         hintText:
-                            'Type here… e.g., “Paid ₦50,000 rent via GTBank” or “Sold goods ₦600,000, VAT 7.5%”',
+                            'Type here… e.g., “Paid ₦50,000 rent via GTBank” or “Sold goods ₦600,000”',
                       ),
                       onChanged: (_) => setState(() {}),
                       onSubmitted: (_) => _handleSubmit(),
