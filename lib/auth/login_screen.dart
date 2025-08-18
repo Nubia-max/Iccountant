@@ -25,7 +25,6 @@ class _LoginScreenState extends State<LoginScreen> {
   void initState() {
     super.initState();
     _auth = AuthController(_repo)..init();
-    // Rebuild UI when controller changes (loading/error state)
     _auth.addListener(() {
       if (mounted) setState(() {});
     });
@@ -55,15 +54,14 @@ class _LoginScreenState extends State<LoginScreen> {
     }
 
     if (_auth.isAuthenticated) {
-      // IMPORTANT: let the parent (main.dart) navigate to /home.
-      widget.onLoggedIn?.call();
-      return; // <- do not Navigator.pop or push again here
+      widget.onLoggedIn?.call(); // let parent route to /home
+      return;
     }
 
     if ((_auth.error ?? '').isNotEmpty && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(_auth.error!.replaceFirst('Exception: ', ''))),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(_auth.error!)));
     }
   }
 
@@ -122,10 +120,7 @@ class _LoginScreenState extends State<LoginScreen> {
                 ),
                 const SizedBox(height: 8),
                 if ((_auth.error ?? '').isNotEmpty)
-                  Text(
-                    _auth.error!.replaceFirst('Exception: ', ''),
-                    style: const TextStyle(color: Colors.red),
-                  ),
+                  Text(_auth.error!, style: const TextStyle(color: Colors.red)),
               ],
             ),
           ),

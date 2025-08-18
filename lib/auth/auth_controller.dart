@@ -1,4 +1,3 @@
-// lib/auth_controller.dart
 import 'package:flutter/foundation.dart';
 import 'auth_repository.dart';
 
@@ -14,10 +13,19 @@ class AuthController with ChangeNotifier {
   String? get error => _error;
   bool get isAuthenticated => _authed;
 
+  /// Called at app start. If Firebase has a session, we’re authenticated.
   Future<void> init() async {
-    final t = await _repo.getToken();
-    _authed = t != null && t.isNotEmpty;
-    notifyListeners();
+    _setLoading(true);
+    try {
+      final t = await _repo.getToken();
+      _authed = t != null && t.isNotEmpty;
+      _error = null;
+    } catch (e) {
+      _authed = false;
+      _error = e.toString();
+    } finally {
+      _setLoading(false);
+    }
   }
 
   Future<void> register(String email, String password, String? fullName) async {
@@ -30,7 +38,7 @@ class AuthController with ChangeNotifier {
       );
       _error = null;
     } catch (e) {
-      _error = e.toString();
+      _error = _pretty(e);
     } finally {
       _setLoading(false);
     }
@@ -43,7 +51,8 @@ class AuthController with ChangeNotifier {
       _authed = true;
       _error = null;
     } catch (e) {
-      _error = e.toString();
+      _authed = false;
+      _error = _pretty(e);
     } finally {
       _setLoading(false);
     }
@@ -58,5 +67,13 @@ class AuthController with ChangeNotifier {
   void _setLoading(bool v) {
     _loading = v;
     notifyListeners();
+  }
+
+  String _pretty(Object e) {
+    final s = e.toString();
+    return s
+        .replaceFirst('Exception: ', '')
+        .replaceFirst('FirebaseAuthException:', '')
+        .trim();
   }
 }

@@ -49,6 +49,8 @@ dependencies:
 
 
   intl: any
+  firebase_core: ^4.0.0
+  firebase_auth: ^6.0.1
 dev_dependencies:
   flutter_test:
     sdk: flutter

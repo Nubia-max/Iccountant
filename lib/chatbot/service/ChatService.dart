@@ -2,12 +2,15 @@
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http/http.dart' as http;
+import 'package:taxpal/auth/auth_repository.dart';
 
 /// Client for your FastAPI backend.
 /// - Persists a simple conversation id locally ("default").
 /// - Calls /chat2 for dual-output AI flow (natural text + JSON actions).
 /// - Lists statements, journals and TB summary for the Iccountant drawer.
 class ChatService {
+  final AuthRepository _authRepo = AuthRepository();
+
   ChatService({String? apiBase, String? key})
     : _apiBase =
           (apiBase == null || apiBase.isEmpty)
@@ -35,6 +38,14 @@ class ChatService {
     id ??= 'default'; // simple single-threaded conversation for now
     await prefs.setString('conversation_id', id);
     return id;
+  }
+
+  Future<http.Response> postJson(String path, Map<String, dynamic> body) async {
+    final headers = await _authRepo.authHeaders(
+      base: {'Content-Type': 'application/json'},
+    );
+    final uri = Uri.parse('$API_BASE$path');
+    return http.post(uri, headers: headers, body: jsonEncode(body));
   }
 
   Future<List<Map<String, dynamic>>> fetchMessages(
