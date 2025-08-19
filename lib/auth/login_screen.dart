@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
-import 'auth_repository.dart';
-import 'auth_controller.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 class LoginScreen extends StatefulWidget {
-  final VoidCallback? onLoggedIn; // parent handles navigation to Home
+  final VoidCallback? onLoggedIn; // navigate to /home when called
   const LoginScreen({super.key, this.onLoggedIn});
 
   @override
@@ -11,57 +10,58 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _repo = AuthRepository();
-  late final AuthController _auth;
-
   final _emailCon = TextEditingController();
   final _pwCon = TextEditingController();
   final _nameCon = TextEditingController();
 
   bool _isLogin = true;
   bool _obscure = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _auth = AuthController(_repo)..init();
-    _auth.addListener(() {
-      if (mounted) setState(() {});
-    });
-  }
+  bool _loading = false;
+  String? _error;
 
   @override
   void dispose() {
     _emailCon.dispose();
     _pwCon.dispose();
     _nameCon.dispose();
-    _auth.removeListener(() {}); // safe no-op
     super.dispose();
   }
 
   Future<void> _submit() async {
-    final email = _emailCon.text.trim();
-    final pw = _pwCon.text;
-    final fullName = _nameCon.text.trim().isEmpty ? null : _nameCon.text.trim();
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
 
-    if (_isLogin) {
-      await _auth.login(email, pw);
-    } else {
-      await _auth.register(email, pw, fullName);
-      if ((_auth.error ?? '').isEmpty) {
-        await _auth.login(email, pw);
+    try {
+      final email = _emailCon.text.trim();
+      final pw = _pwCon.text;
+      if (_isLogin) {
+        await FirebaseAuth.instance.signInWithEmailAndPassword(
+          email: email,
+          password: pw,
+        );
+      } else {
+        final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
+          email: email,
+          password: pw,
+        );
+        final fullName = _nameCon.text.trim();
+        if (fullName.isNotEmpty) {
+          await cred.user?.updateDisplayName(fullName);
+        }
       }
-    }
 
-    if (_auth.isAuthenticated) {
-      widget.onLoggedIn?.call(); // let parent route to /home
-      return;
-    }
+      // Force-refresh ID token so our first API call has a valid token
+      await FirebaseAuth.instance.currentUser?.getIdToken(true);
 
-    if ((_auth.error ?? '').isNotEmpty && mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(_auth.error!)));
+      widget.onLoggedIn?.call();
+    } on FirebaseAuthException catch (e) {
+      setState(() => _error = e.message ?? 'Authentication failed.');
+    } catch (e) {
+      setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
     }
   }
 
@@ -106,8 +106,8 @@ class _LoginScreenState extends State<LoginScreen> {
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton(
-                    onPressed: _auth.isLoading ? null : _submit,
-                    child: Text(_auth.isLoading ? 'Please wait…' : title),
+                    onPressed: _loading ? null : _submit,
+                    child: Text(_loading ? 'Please wait…' : title),
                   ),
                 ),
                 TextButton(
@@ -118,9 +118,10 @@ class _LoginScreenState extends State<LoginScreen> {
                         : "Already have an account? Sign in",
                   ),
                 ),
-                const SizedBox(height: 8),
-                if ((_auth.error ?? '').isNotEmpty)
-                  Text(_auth.error!, style: const TextStyle(color: Colors.red)),
+                if ((_error ?? '').isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  Text(_error!, style: const TextStyle(color: Colors.red)),
+                ],
               ],
             ),
           ),

@@ -51,6 +51,7 @@ dependencies:
   intl: any
   firebase_core: ^4.0.0
   firebase_auth: ^6.0.1
+  pluto_grid: ^8.0.0
 dev_dependencies:
   flutter_test:
     sdk: flutter

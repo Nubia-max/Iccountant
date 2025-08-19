@@ -1,108 +1,64 @@
-// lib/chat_screen.dart
+// lib/chatbot/screens/chat_screen.dart
+// Chat + "Iccountant" drawer with mini-worksheets + full-screen viewers.
+
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:dash_chat_2/dash_chat_2.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:image_picker/image_picker.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:unicons/unicons.dart';
+import 'package:http/http.dart' as http;
+import 'package:firebase_auth/firebase_auth.dart';
 
-// Adjust path if your file lives elsewhere
-import 'package:taxpal/chatbot/service/ChatService.dart';
-import 'package:taxpal/chatbot/screens/ImageScreen.dart';
-
-// New drawer widget (below)
-import 'package:taxpal/widgets/iccountant_drawer.dart';
+/// Same env var used in other files (main.dart, services, etc.)
+const String API_BASE = String.fromEnvironment(
+  'API_BASE',
+  defaultValue: 'http://127.0.0.1:8000',
+);
 
 class ChatScreen extends StatefulWidget {
-  final VoidCallback? toggleDrawer;
-  const ChatScreen({super.key, this.toggleDrawer});
+  const ChatScreen({super.key});
 
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  // Drawer
   bool isDrawerOpen = false;
 
   // Chat state
   final List<ChatMessage> messages = [];
-  final ChatUser user = ChatUser(id: '1', firstName: 'You');
-  final ChatUser bot = ChatUser(id: '2', firstName: 'Iccountant');
+  final ChatUser user = ChatUser(id: 'u', firstName: 'You');
+  final ChatUser bot = ChatUser(id: 'b', firstName: 'Iccountant');
 
-  /// System prompt (kept simple; backend handles accounting)
-  final List<Map<String, dynamic>> chatHistory = <Map<String, dynamic>>[
-    {
-      "role": "system",
-      "content":
-          "You are a concise assistant. When users ask general questions, answer helpfully and briefly.",
-    },
-  ];
-
-  // Services / controllers
-  final FlutterTts flutterTts = FlutterTts();
+  // UI & voice
   final TextEditingController inputCon = TextEditingController();
   final SpeechToText _speechToText = SpeechToText();
   final ImagePicker _picker = ImagePicker();
-  final FlutterSecureStorage _storage = const FlutterSecureStorage();
-  ChatService? chatService;
-
   bool isListening = false;
-  bool isTTS = false;
-  bool _ready = false;
 
-  // Pending images before sending (display only)
+  // Pending images (local preview only)
   final List<XFile> _pendingImages = [];
+
+  // Drawer data (mini-worksheets)
+  List<Map<String, dynamic>> _tbRows = [];
+  Map<String, num> _tbTotals = const {'debit': 0, 'credit': 0};
+  List<Map<String, dynamic>> _journalEntries = [];
+  List<Map<String, dynamic>> _statements = [];
+
+  bool _loadingDrawer = false;
+  bool _loadingHistory = false;
 
   @override
   void initState() {
     super.initState();
-    _bootstrap();
-  }
-
-  Future<void> _bootstrap() async {
-    // Create service. API base can be passed via --dart-define=API_BASE=...
-    chatService = ChatService(
-      apiBase: const String.fromEnvironment('API_BASE', defaultValue: ''),
-    );
-
-    await _initSpeech();
-    await _ttsSettings();
-    setState(() => _ready = true);
-    await _loadHistoryFromBackend();
-  }
-
-  Future<void> _loadHistoryFromBackend() async {
-    if (chatService == null) return;
-    try {
-      final convId = await chatService!.ensureActiveConversation();
-      if (convId == null) return;
-      final backendMsgs = await chatService!.fetchMessages(convId);
-      // Convert maps -> DashChat messages (newest first)
-      final converted =
-          backendMsgs.map((m) {
-            final role = (m['role'] ?? '').toString();
-            final text = (m['content'] ?? '').toString();
-            final createdStr = (m['created_at'] ?? '').toString();
-            final created = DateTime.tryParse(createdStr) ?? DateTime.now();
-            final who = role == 'user' ? user : bot;
-            return ChatMessage(text: text, createdAt: created, user: who);
-          }).toList();
-
-      setState(() {
-        messages
-          ..clear()
-          ..addAll(converted.reversed);
-      });
-    } catch (e) {
-      debugPrint('History load error: $e');
-    }
+    _initSpeech();
+    _loadHistory();
   }
 
   Future<void> _initSpeech() async {
@@ -112,24 +68,166 @@ class _ChatScreenState extends State<ChatScreen> {
           setState(() => isListening = false);
         }
       },
-      onError: (e) {
-        debugPrint("Speech error: $e");
-        setState(() => isListening = false);
-      },
+      onError: (_) => setState(() => isListening = false),
     );
   }
 
-  Future<void> _ttsSettings() async {
-    if (await flutterTts.isLanguageAvailable("en-US")) {
-      await flutterTts.setLanguage("en-US");
-      await flutterTts.setVoice({
-        "name": "en-us-x-tpd-local",
-        "locale": "en-US",
-      });
+  Future<Map<String, String>> _authHeaders() async {
+    // Force refresh to avoid expired/empty token issues right after sign up
+    final tok = await FirebaseAuth.instance.currentUser?.getIdToken(true);
+    return {
+      'Accept': 'application/json',
+      if (tok != null) 'Authorization': 'Bearer $tok',
+    };
+  }
+
+  // ------- Load chat history (newest first for DashChat)
+  Future<void> _loadHistory() async {
+    setState(() => _loadingHistory = true);
+    try {
+      final h = await _authHeaders();
+      final uri = Uri.parse('$API_BASE/messages?conversation_id=default');
+      final res = await http.get(uri, headers: h);
+      if (res.statusCode == 200) {
+        final List body = jsonDecode(res.body) as List;
+        final items = body.map((e) => e as Map<String, dynamic>).toList();
+        final converted =
+            items.map((m) {
+              final who = (m['role'] == 'user') ? user : bot;
+              final createdAt = DateTime.tryParse(
+                m['created_at']?.toString() ?? '',
+              );
+              return ChatMessage(
+                text: (m['content'] ?? '').toString(),
+                createdAt: createdAt ?? DateTime.now(),
+                user: who,
+              );
+            }).toList();
+        setState(() {
+          messages
+            ..clear()
+            ..addAll(converted.reversed);
+        });
+      }
+    } catch (_) {
+      /* ignore for now */
+    } finally {
+      if (mounted) setState(() => _loadingHistory = false);
     }
   }
 
-  // ===== Speech handlers
+  // ------- Drawer fetch
+  Future<void> _loadDrawer() async {
+    setState(() => _loadingDrawer = true);
+    try {
+      final h = await _authHeaders();
+
+      // Trial balance rows
+      final tbRes = await http.get(
+        Uri.parse('$API_BASE/trial_balance'),
+        headers: h,
+      );
+      if (tbRes.statusCode == 200) {
+        final tb = jsonDecode(tbRes.body) as Map<String, dynamic>;
+        _tbRows =
+            (tb['rows'] as List? ?? const [])
+                .map((e) => (e as Map).cast<String, dynamic>())
+                .toList();
+        _tbTotals =
+            (tb['totals'] as Map?)?.cast<String, num>() ??
+            const {'debit': 0, 'credit': 0};
+      } else {
+        _tbRows = [];
+        _tbTotals = const {'debit': 0, 'credit': 0};
+      }
+
+      // Journals (each item has "lines")
+      final jRes = await http.get(
+        Uri.parse('$API_BASE/journals?limit=20'),
+        headers: h,
+      );
+      _journalEntries =
+          (jRes.statusCode == 200)
+              ? (jsonDecode(jRes.body) as List)
+                  .map((e) => (e as Map).cast<String, dynamic>())
+                  .toList()
+              : <Map<String, dynamic>>[];
+
+      // Statements list (id, name, period)
+      final sRes = await http.get(
+        Uri.parse('$API_BASE/statements?limit=50'),
+        headers: h,
+      );
+      _statements =
+          (sRes.statusCode == 200)
+              ? (jsonDecode(sRes.body) as List)
+                  .map((e) => (e as Map).cast<String, dynamic>())
+                  .toList()
+              : <Map<String, dynamic>>[];
+
+      if (mounted) setState(() {});
+    } catch (_) {
+      // ignore for now
+    } finally {
+      if (mounted) setState(() => _loadingDrawer = false);
+    }
+  }
+
+  // ------- Chat send flow (calls /chat2 directly with Firebase token)
+  Future<void> _handleSubmit() async {
+    final prompt = inputCon.text.trim();
+    final hasImages = _pendingImages.isNotEmpty;
+    final hasText = prompt.isNotEmpty;
+    if (!hasImages && !hasText) return;
+
+    // Show user message
+    messages.insert(
+      0,
+      ChatMessage(text: prompt, createdAt: DateTime.now(), user: user),
+    );
+    setState(() {});
+    inputCon.clear();
+    _pendingImages.clear();
+
+    String reply = "…";
+    try {
+      final h = await _authHeaders();
+      final uri = Uri.parse('$API_BASE/chat2');
+      final res = await http.post(
+        uri,
+        headers: {...h, 'Content-Type': 'application/json'},
+        body: jsonEncode({'conversation_id': 'default', 'message': prompt}),
+      );
+
+      if (res.statusCode == 200) {
+        final body = jsonDecode(res.body) as Map<String, dynamic>;
+        reply =
+            (body['assistant_message'] ?? body['message'] ?? 'Done.')
+                .toString();
+        // Optional: if actions posted statements, refresh drawer
+        await _loadDrawer();
+      } else if (res.statusCode == 401) {
+        reply = "You’re not signed in (401). Please login again.";
+      } else if (res.statusCode == 400) {
+        final body = jsonDecode(res.body);
+        reply =
+            (body['error'] ?? body['message'] ?? 'I need a bit more info.')
+                .toString();
+      } else {
+        reply = "Backend error ${res.statusCode}";
+      }
+    } catch (e) {
+      reply = "Network error: $e";
+    }
+
+    messages.insert(
+      0,
+      ChatMessage(text: reply, createdAt: DateTime.now(), user: bot),
+    );
+    setState(() {});
+  }
+
+  // ------- Voice
   Future<void> _startListening() async {
     if (isListening) {
       await _speechToText.stop();
@@ -148,34 +246,16 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _onSpeechResult(SpeechRecognitionResult r) {
-    setState(() => inputCon.text = r.recognizedWords);
+    setState(() {
+      inputCon.text = r.recognizedWords;
+    });
     if (r.finalResult) {
       _speechToText.stop();
       setState(() => isListening = false);
     }
   }
 
-  // ===== Attachments (UI-only for now)
-  Future<void> _pickImagesFromGallery() async {
-    final picks = await _picker.pickMultiImage();
-    if (picks.isEmpty) return;
-    _pendingImages.addAll(picks);
-    setState(() {});
-  }
-
-  Future<void> _captureImageCamera() async {
-    final shot = await _picker.pickImage(source: ImageSource.camera);
-    if (shot == null) return;
-    _pendingImages.add(shot);
-    setState(() {});
-  }
-
-  void _removePendingImage(int i) {
-    if (i < 0 || i >= _pendingImages.length) return;
-    _pendingImages.removeAt(i);
-    setState(() {});
-  }
-
+  // ------- Attachments preview row (images only, local)
   Widget _buildPendingPreviewRow() {
     if (_pendingImages.isEmpty) return const SizedBox.shrink();
     return SizedBox(
@@ -203,7 +283,10 @@ class _ChatScreenState extends State<ChatScreen> {
                 top: -6,
                 right: -6,
                 child: GestureDetector(
-                  onTap: () => _removePendingImage(i),
+                  onTap: () {
+                    _pendingImages.removeAt(i);
+                    setState(() {});
+                  },
                   child: Container(
                     padding: const EdgeInsets.all(2),
                     decoration: BoxDecoration(
@@ -225,226 +308,334 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // ===== Chat send flow
-  Future<void> _handleSubmit() async {
-    if (!_ready || chatService == null) return;
-
-    final prompt = inputCon.text.trim();
-    final hasImages = _pendingImages.isNotEmpty;
-    final hasText = prompt.isNotEmpty;
-    if (!hasImages && !hasText) return;
-
-    // 1) Show user message immediately
-    List<ChatMedia>? medias;
-    if (hasImages) {
-      medias =
-          _pendingImages
-              .map(
-                (x) => ChatMedia(
-                  url: x.path,
-                  fileName: x.name,
-                  type: MediaType.image,
-                ),
-              )
-              .toList();
-    }
-    final userMsg = ChatMessage(
-      text: prompt,
-      createdAt: DateTime.now(),
-      user: user,
-      medias: medias,
-    );
-    messages.insert(0, userMsg);
-    await _saveChatMessage(prompt, medias);
-    setState(() {});
-    inputCon.clear();
-    _pendingImages.clear();
-
-    // 2) Ask backend (/chat2). The backend persists everything.
-    String reply;
-    try {
-      reply = await chatService!.handlePrompt(chatHistory, prompt);
-    } catch (e) {
-      reply = "There was a problem: $e";
-      debugPrint(e.toString());
-    }
-
-    // 3) Show assistant reply
-    final botMsg = ChatMessage(
-      text: reply,
-      createdAt: DateTime.now(),
-      user: bot,
-    );
-    messages.insert(0, botMsg);
-    setState(() {});
-
-    // Optional TTS
-    if (isTTS && reply.isNotEmpty) {
-      await flutterTts.speak(reply);
-    }
-  }
-
-  // ===== Local log (backend is source of truth)
-  Future<void> _saveChatMessage(String message, List<ChatMedia>? medias) async {
-    final chatMessage = {
-      'text': message,
-      'createdAt': DateTime.now().toString(),
-      'user': 'user',
-      'media': medias?.map((e) => e.url).toList(),
-    };
-
-    final prefs = await SharedPreferences.getInstance();
-    final messagesList = prefs.getStringList('chatHistory') ?? [];
-    messagesList.add(jsonEncode(chatMessage));
-    await prefs.setStringList('chatHistory', messagesList);
-  }
-
-  void _showAttachSheet() {
-    showModalBottomSheet(
-      context: context,
-      showDragHandle: true,
-      builder:
-          (_) => SafeArea(
-            child: Wrap(
+  // ------- Drawer UI (mini-worksheets grid)
+  Widget _drawer() {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      height: isDrawerOpen ? 420 : 60,
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(
+          bottom: BorderSide(color: Colors.grey.withOpacity(0.3), width: 1),
+        ),
+      ),
+      child: Column(
+        children: [
+          ListTile(
+            onTap: () async {
+              setState(() => isDrawerOpen = !isDrawerOpen);
+              if (!isDrawerOpen) return;
+              await _loadDrawer();
+            },
+            title: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                ListTile(
-                  leading: const Icon(Icons.photo_library),
-                  title: const Text('Select images from gallery'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _pickImagesFromGallery();
-                  },
+                const Text('Iccountant', style: TextStyle(fontSize: 18)),
+                Icon(
+                  isDrawerOpen
+                      ? Icons.keyboard_arrow_up
+                      : Icons.keyboard_arrow_down,
                 ),
-                ListTile(
-                  leading: const Icon(Icons.photo_camera),
-                  title: const Text('Take a photo'),
-                  onTap: () {
-                    Navigator.pop(context);
-                    _captureImageCamera();
-                  },
-                ),
-                ListTile(
-                  leading: const Icon(Icons.insert_drive_file),
-                  title: const Text('Attach file'),
-                  onTap: () async {
-                    Navigator.pop(context);
-                    final result = await FilePicker.platform.pickFiles(
-                      allowMultiple: false,
-                    );
-                    if (result != null && result.files.isNotEmpty) {
-                      messages.insert(
-                        0,
-                        ChatMessage(
-                          createdAt: DateTime.now(),
-                          user: user,
-                          medias: [
-                            ChatMedia(
-                              url: result.files.first.path!,
-                              fileName: result.files.first.name,
-                              type: MediaType.file,
+              ],
+            ),
+          ),
+          if (isDrawerOpen)
+            Expanded(
+              child:
+                  _loadingDrawer
+                      ? const Center(
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                      : Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 10),
+                        child: GridView(
+                          gridDelegate:
+                              const SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: 3,
+                                mainAxisSpacing: 10,
+                                crossAxisSpacing: 10,
+                                childAspectRatio: 1.35,
+                              ),
+                          children: [
+                            _miniSheetCard(
+                              title: 'Trial Balance',
+                              child: _miniTable(
+                                headers: const ['Account', 'Debit', 'Credit'],
+                                rows:
+                                    _tbRows
+                                        .take(10)
+                                        .map(
+                                          (r) => [
+                                            r['account']?.toString() ?? '',
+                                            (r['debit'] ?? 0).toString(),
+                                            (r['credit'] ?? 0).toString(),
+                                          ],
+                                        )
+                                        .toList(),
+                              ),
+                              onOpen: _openTrialBalanceFull,
+                            ),
+                            _miniSheetCard(
+                              title: 'Journals',
+                              child: _miniTable(
+                                headers: const [
+                                  'Date',
+                                  'Narration',
+                                  'Dr Acct',
+                                  'Dr',
+                                  'Cr Acct',
+                                  'Cr',
+                                ],
+                                rows:
+                                    _journalEntries
+                                        .take(10)
+                                        .map(_flattenJournalRow)
+                                        .toList(),
+                              ),
+                              onOpen: _openJournalsFull,
+                            ),
+                            _miniSheetCard(
+                              title: 'Statements',
+                              child: _miniStatementsList(),
+                              onOpen: _openStatementsListFull,
                             ),
                           ],
                         ),
-                      );
-                      setState(() {});
-                    }
-                  },
-                ),
-              ],
-            ),
-          ),
-    );
-  }
-
-  // ===== UI
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Column(
-        children: [
-          // Top Iccountant drawer (collapsible)
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 300),
-            height: isDrawerOpen ? 600 : 60,
-            decoration: BoxDecoration(
-              color: Colors.white,
-              border: Border(
-                bottom: BorderSide(
-                  color: Colors.grey.withOpacity(0.3),
-                  width: 1,
-                ),
-              ),
-            ),
-            child: Column(
-              children: [
-                GestureDetector(
-                  onTap: () => setState(() => isDrawerOpen = !isDrawerOpen),
-                  child: ListTile(
-                    title: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text(
-                          'Iccountant',
-                          style: TextStyle(color: Colors.black, fontSize: 18),
-                        ),
-                        Icon(
-                          isDrawerOpen
-                              ? Icons.keyboard_arrow_up
-                              : Icons.keyboard_arrow_down,
-                          color: Colors.black,
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-                if (isDrawerOpen)
-                  SizedBox(
-                    height: 540,
-                    child:
-                        chatService == null
-                            ? const Center(child: CircularProgressIndicator())
-                            : IccountantDrawer(chatService: chatService!),
-                  ),
-              ],
-            ),
-          ),
-
-          // Chat list
-          Expanded(
-            child: DashChat(
-              currentUser: user,
-              onSend: (_) {},
-              readOnly: true,
-              messages: messages,
-              messageOptions: MessageOptions(
-                onTapMedia: (item) {
-                  if (item.type == MediaType.image) {
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (context) => ImageScreen(item.url),
                       ),
-                    );
-                  }
-                },
-              ),
             ),
-          ),
-
-          // Pending attachments preview
-          _buildPendingPreviewRow(),
-
-          // Input Bar
-          _buildInputCard(),
         ],
       ),
     );
   }
 
-  Widget _buildInputCard() {
+  // Build one-row snapshot from a journal entry (first DR & first CR line)
+  List<String> _flattenJournalRow(Map<String, dynamic> e) {
+    String drAcct = '', crAcct = '';
+    num dr = 0, cr = 0;
+    final lines = (e['lines'] as List? ?? const []).cast<Map>();
+    for (final ln in lines) {
+      final debit = (ln['debit'] ?? 0) as num;
+      final credit = (ln['credit'] ?? 0) as num;
+      if (debit > 0 && dr == 0) {
+        dr = debit;
+        drAcct = (ln['account'] ?? '').toString();
+      }
+      if (credit > 0 && cr == 0) {
+        cr = credit;
+        crAcct = (ln['account'] ?? '').toString();
+      }
+      if (dr > 0 && cr > 0) break;
+    }
+    return [
+      (e['date'] ?? '').toString(),
+      (e['narration'] ?? '').toString(),
+      drAcct,
+      dr.toString(),
+      crAcct,
+      cr.toString(),
+    ];
+  }
+
+  Widget _miniSheetCard({
+    required String title,
+    required Widget child,
+    required VoidCallback onOpen,
+  }) {
+    return Card(
+      elevation: 0,
+      color: Colors.grey.shade50,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: InkWell(
+        onTap: onOpen,
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 14,
+                    ),
+                  ),
+                  const Spacer(),
+                  const Icon(Icons.open_in_new, size: 16),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Expanded(child: child),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _miniTable({
+    required List<String> headers,
+    required List<List<String>> rows,
+  }) {
+    return Scrollbar(
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(minWidth: 420),
+          child: Scrollbar(
+            thumbVisibility: true,
+            child: SingleChildScrollView(
+              child: DataTable(
+                headingTextStyle: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12,
+                ),
+                dataTextStyle: const TextStyle(fontSize: 12),
+                columns:
+                    headers.map((h) => DataColumn(label: Text(h))).toList(),
+                rows:
+                    rows
+                        .map(
+                          (r) => DataRow(
+                            cells: r.map((c) => DataCell(Text(c))).toList(),
+                          ),
+                        )
+                        .toList(),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _miniStatementsList() {
+    if (_statements.isEmpty) {
+      return const Center(
+        child: Text('No statements yet', style: TextStyle(fontSize: 12)),
+      );
+    }
+    return ListView.separated(
+      itemCount: _statements.length.clamp(0, 6),
+      separatorBuilder: (_, __) => const Divider(height: 1),
+      itemBuilder: (_, i) {
+        final s = _statements[i];
+        final name = (s['name'] ?? '').toString();
+        final ps = (s['period_start'] ?? '').toString();
+        final pe = (s['period_end'] ?? '').toString();
+        return ListTile(
+          dense: true,
+          contentPadding: EdgeInsets.zero,
+          title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
+          subtitle: Text([ps, pe].where((x) => x.isNotEmpty).join(' → ')),
+          trailing: const Icon(Icons.chevron_right, size: 16),
+          onTap: () => _openStatementDetail(s['id']),
+        );
+      },
+    );
+  }
+
+  // ------- Full screens
+  void _openTrialBalanceFull() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) => _FullTableScreen(
+              title: 'Trial Balance',
+              headers: const ['Account', 'Debit', 'Credit'],
+              rows:
+                  _tbRows
+                      .map(
+                        (r) => [
+                          r['account']?.toString() ?? '',
+                          (r['debit'] ?? 0).toString(),
+                          (r['credit'] ?? 0).toString(),
+                        ],
+                      )
+                      .toList(),
+            ),
+      ),
+    );
+  }
+
+  void _openJournalsFull() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder:
+            (_) => _FullTableScreen(
+              title: 'Journals',
+              headers: const [
+                'Date',
+                'Narration',
+                'Dr Acct',
+                'Dr',
+                'Cr Acct',
+                'Cr',
+              ],
+              rows: _journalEntries.map(_flattenJournalRow).toList(),
+            ),
+      ),
+    );
+  }
+
+  void _openStatementsListFull() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const _StatementsListScreen()),
+    );
+  }
+
+  Future<void> _openStatementDetail(dynamic id) async {
+    final h = await _authHeaders();
+    final res = await http.get(
+      Uri.parse('$API_BASE/statements/$id'),
+      headers: h,
+    );
+    if (res.statusCode != 200) return;
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    if (!mounted) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => _StatementDetailScreen(statement: body),
+      ),
+    );
+  }
+
+  // ------- Build
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Column(
+        children: [
+          _drawer(),
+          Expanded(
+            child:
+                _loadingHistory
+                    ? const Center(
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                    : DashChat(
+                      currentUser: user,
+                      onSend: (_) {},
+                      readOnly: true,
+                      messages: messages,
+                    ),
+          ),
+          _buildPendingPreviewRow(),
+          _inputBar(),
+        ],
+      ),
+    );
+  }
+
+  Widget _inputBar() {
     final canSend =
-        _ready &&
-        (inputCon.text.trim().isNotEmpty || _pendingImages.isNotEmpty);
+        inputCon.text.trim().isNotEmpty || _pendingImages.isNotEmpty;
     return Card(
       color: Colors.white,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
@@ -456,31 +647,29 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             IconButton(
               icon: const Icon(Icons.attach_file_sharp, color: Colors.black),
-              onPressed: _showAttachSheet,
+              onPressed: () async {
+                final result = await FilePicker.platform.pickFiles(
+                  allowMultiple: false,
+                );
+                if (result != null && result.files.isNotEmpty) {
+                  // Keep local preview simple for now
+                  setState(() {});
+                }
+              },
             ),
             Expanded(
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 120),
-                child: Scrollbar(
-                  thumbVisibility: true,
-                  child: SingleChildScrollView(
-                    scrollDirection: Axis.vertical,
-                    reverse: true,
-                    child: TextField(
-                      controller: inputCon,
-                      maxLines: null,
-                      minLines: 1,
-                      keyboardType: TextInputType.multiline,
-                      decoration: const InputDecoration(
-                        border: InputBorder.none,
-                        hintText:
-                            'Type here… e.g., “Paid ₦50,000 rent via GTBank” or “Sold goods ₦600,000”',
-                      ),
-                      onChanged: (_) => setState(() {}),
-                      onSubmitted: (_) => _handleSubmit(),
-                    ),
-                  ),
+              child: TextField(
+                controller: inputCon,
+                maxLines: null,
+                minLines: 1,
+                keyboardType: TextInputType.multiline,
+                decoration: const InputDecoration(
+                  border: InputBorder.none,
+                  hintText:
+                      'Type here… e.g., “Sold goods ₦5,000 on credit to Tunde”',
                 ),
+                onChanged: (_) => setState(() {}),
+                onSubmitted: (_) => _handleSubmit(),
               ),
             ),
             IconButton(
@@ -488,7 +677,6 @@ class _ChatScreenState extends State<ChatScreen> {
                 isListening ? UniconsLine.stop_circle : UniconsLine.microphone,
                 color: isListening ? Colors.red : Colors.black54,
               ),
-              iconSize: 20,
               onPressed: _startListening,
             ),
             IconButton(
@@ -509,6 +697,183 @@ class _ChatScreenState extends State<ChatScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ===== Full-table viewer =====
+class _FullTableScreen extends StatelessWidget {
+  final String title;
+  final List<String> headers;
+  final List<List<String>> rows;
+  const _FullTableScreen({
+    required this.title,
+    required this.headers,
+    required this.rows,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      body: Scrollbar(
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minWidth: 700),
+            child: Scrollbar(
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                child: DataTable(
+                  columns:
+                      headers.map((h) => DataColumn(label: Text(h))).toList(),
+                  rows:
+                      rows
+                          .map(
+                            (r) => DataRow(
+                              cells: r.map((c) => DataCell(Text(c))).toList(),
+                            ),
+                          )
+                          .toList(),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ===== Statements list (full) =====
+class _StatementsListScreen extends StatefulWidget {
+  const _StatementsListScreen();
+
+  @override
+  State<_StatementsListScreen> createState() => _StatementsListScreenState();
+}
+
+class _StatementsListScreenState extends State<_StatementsListScreen> {
+  List<Map<String, dynamic>> _items = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    try {
+      final tok = await FirebaseAuth.instance.currentUser?.getIdToken();
+      final res = await http.get(
+        Uri.parse('$API_BASE/statements?limit=200'),
+        headers: {
+          'Accept': 'application/json',
+          if (tok != null) 'Authorization': 'Bearer $tok',
+        },
+      );
+      if (res.statusCode == 200) {
+        final List body = jsonDecode(res.body) as List;
+        setState(() {
+          _items = body.map((e) => (e as Map).cast<String, dynamic>()).toList();
+        });
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _loading = false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Statements')),
+      body:
+          _loading
+              ? const Center(child: CircularProgressIndicator(strokeWidth: 2))
+              : ListView.separated(
+                itemCount: _items.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (_, i) {
+                  final s = _items[i];
+                  final name = (s['name'] ?? '').toString();
+                  final ps = (s['period_start'] ?? '').toString();
+                  final pe = (s['period_end'] ?? '').toString();
+                  return ListTile(
+                    title: Text(name),
+                    subtitle: Text(
+                      [ps, pe].where((x) => x.isNotEmpty).join(' → '),
+                    ),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () async {
+                      final tok =
+                          await FirebaseAuth.instance.currentUser?.getIdToken();
+                      final res = await http.get(
+                        Uri.parse('$API_BASE/statements/${s['id']}'),
+                        headers: {
+                          'Accept': 'application/json',
+                          if (tok != null) 'Authorization': 'Bearer $tok',
+                        },
+                      );
+                      if (res.statusCode == 200 && context.mounted) {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder:
+                                (_) => _StatementDetailScreen(
+                                  statement:
+                                      jsonDecode(res.body)
+                                          as Map<String, dynamic>,
+                                ),
+                          ),
+                        );
+                      }
+                    },
+                  );
+                },
+              ),
+    );
+  }
+}
+
+// ===== Statement detail (generic renderer) =====
+class _StatementDetailScreen extends StatelessWidget {
+  final Map<String, dynamic> statement;
+  const _StatementDetailScreen({required this.statement});
+
+  Widget _renderContent(dynamic content) {
+    if (content is Map<String, dynamic>) {
+      final entries = content.entries.toList();
+      return ListView.separated(
+        itemCount: entries.length,
+        separatorBuilder: (_, __) => const Divider(height: 1),
+        itemBuilder: (_, i) {
+          final k = entries[i].key.toString();
+          final v = entries[i].value;
+          return ListTile(
+            title: Text(k),
+            trailing: Text(v is num ? v.toStringAsFixed(2) : v.toString()),
+          );
+        },
+      );
+    }
+    if (content is List) {
+      return ListView.separated(
+        itemCount: content.length,
+        separatorBuilder: (_, __) => const Divider(height: 1),
+        itemBuilder: (_, i) => ListTile(title: Text(content[i].toString())),
+      );
+    }
+    return Center(child: Text(content?.toString() ?? 'No content'));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final name = (statement['name'] ?? 'Statement').toString();
+    final content = statement['content'];
+    return Scaffold(
+      appBar: AppBar(title: Text(name)),
+      body: _renderContent(content),
     );
   }
 }

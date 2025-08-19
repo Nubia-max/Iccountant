@@ -1,408 +1,381 @@
-// lib/widgets/iccountant_drawer.dart
 import 'package:flutter/material.dart';
 import 'package:taxpal/chatbot/service/ChatService.dart';
+import 'package:taxpal/books/worksheet_screen.dart';
 
-/// Drawer content that shows accounting data:
-/// - Trial Balance quick view
-/// - Saved Statements (any type)
-/// - Recent Journals
-///
-/// Vertical sections; each section scrolls horizontally.
-/// Tapping a card opens a bottom sheet with more details.
+/// Collapsible drawer that shows mini "worksheet" previews:
+/// - Trial Balance (mini table)
+/// - Journals (recent summary)
+/// - Statements (cards)
 class IccountantDrawer extends StatefulWidget {
-  final ChatService chatService;
-  const IccountantDrawer({super.key, required this.chatService});
+  const IccountantDrawer({super.key});
 
   @override
   State<IccountantDrawer> createState() => _IccountantDrawerState();
 }
 
 class _IccountantDrawerState extends State<IccountantDrawer> {
+  final ChatService _svc = ChatService();
+
+  bool _open = false;
   bool _loading = true;
-  List<Map<String, dynamic>> _statements = [];
+
+  // Trial Balance
+  List<Map<String, dynamic>> _tbRows = [];
+  Map<String, dynamic>? _tbTotals;
+
+  // Journals
   List<Map<String, dynamic>> _journals = [];
-  Map<String, dynamic> _tb = {};
+
+  // Statements (metadata list from /statements)
+  List<Map<String, dynamic>> _statements = [];
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _loadAll();
   }
 
-  Future<void> _load() async {
+  Future<void> _loadAll() async {
+    setState(() => _loading = true);
     try {
-      final st = await widget.chatService.listStatements(limit: 50);
-      final jr = await widget.chatService.listJournals(limit: 20);
-      final tb = await widget.chatService.trialBalanceSummary();
+      // --- Trial Balance
+      final tbResp = await _svc.trialBalance(); // {rows: [], totals: {}}
+      final rows =
+          (tbResp['rows'] as List? ?? const [])
+              .map((e) => Map<String, dynamic>.from(e as Map))
+              .toList();
+      final totals = Map<String, dynamic>.from(
+        (tbResp['totals'] as Map?) ?? {},
+      );
+
+      // --- Journals
+      final journals = await _svc.listJournals(limit: 20);
+
+      // --- Statements (metadata)
+      final statements = await _svc.listStatements(limit: 200);
+
       setState(() {
-        _statements = st;
-        _journals = jr;
-        _tb = tb;
+        _tbRows = rows;
+        _tbTotals = totals;
+        _journals = journals;
+        _statements = statements;
         _loading = false;
       });
-    } catch (e) {
+    } catch (_) {
       setState(() => _loading = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const Center(child: CircularProgressIndicator());
-    }
-
-    return SingleChildScrollView(
-      padding: const EdgeInsets.only(bottom: 12),
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 250),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(
+          bottom: BorderSide(color: Colors.grey.withOpacity(0.25), width: 1),
+        ),
+      ),
+      height: _open ? 420 : 60,
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _Section(
-            title: 'Trial Balance',
-            child: SizedBox(
-              height: 160,
-              child: ListView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                children: [
-                  _TileCard(
-                    title: 'Totals',
-                    subtitle:
-                        'DR: ${_num(_tb['totals']?['debit'])} • CR: ${_num(_tb['totals']?['credit'])}',
-                    onTap: () => _showTrialBalanceSheet(context),
-                  ),
-                  const SizedBox(width: 12),
-                  // Show top few accounts as small cards (if available)
-                  ..._topTbRows()
-                      .map(
-                        (r) => Padding(
-                          padding: const EdgeInsets.only(right: 12),
-                          child: _TileCard(
-                            title: (r['account'] ?? 'Account').toString(),
-                            subtitle:
-                                'DR ${_num(r['debit'])} • CR ${_num(r['credit'])}',
-                            onTap: () => _showTrialBalanceSheet(context),
-                          ),
+          ListTile(
+            title: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Iccountant',
+                  style: TextStyle(fontSize: 18, color: Colors.black),
+                ),
+                Icon(
+                  _open ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                  color: Colors.black,
+                ),
+              ],
+            ),
+            onTap: () => setState(() => _open = !_open),
+          ),
+          if (_open)
+            Expanded(
+              child:
+                  _loading
+                      ? const Center(
+                        child: Padding(
+                          padding: EdgeInsets.only(bottom: 16),
+                          child: CircularProgressIndicator(strokeWidth: 2),
                         ),
                       )
-                      .toList(),
-                ],
-              ),
-            ),
-          ),
-
-          _Section(
-            title: 'Statements',
-            child: SizedBox(
-              height: 170,
-              child: ListView.separated(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                scrollDirection: Axis.horizontal,
-                itemCount: _statements.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 12),
-                itemBuilder: (ctx, i) {
-                  final s = _statements[i];
-                  final title = (s['name'] ?? 'Statement').toString();
-                  final perStart = (s['period_start'] ?? '').toString();
-                  final perEnd = (s['period_end'] ?? '').toString();
-                  final subtitle =
-                      (perStart.isEmpty && perEnd.isEmpty)
-                          ? 'Saved'
-                          : '$perStart → $perEnd';
-                  return _TileCard(
-                    title: title,
-                    subtitle: subtitle,
-                    onTap: () => _showStatementSheet(context, s),
-                  );
-                },
-              ),
-            ),
-          ),
-
-          _Section(
-            title: 'Recent Journals',
-            child: SizedBox(
-              height: 170,
-              child: ListView.separated(
-                padding: const EdgeInsets.symmetric(horizontal: 12),
-                scrollDirection: Axis.horizontal,
-                itemCount: _journals.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 12),
-                itemBuilder: (ctx, i) {
-                  final j = _journals[i];
-                  final date = (j['date'] ?? '').toString();
-                  final narr = (j['narration'] ?? '').toString();
-                  final lines = (j['lines'] as List?) ?? const [];
-                  final firstLine =
-                      lines.isNotEmpty
-                          ? '${lines.first['account']}  (DR ${_num(lines.first['debit'])}, CR ${_num(lines.first['credit'])})'
-                          : 'Tap to view lines';
-                  return _TileCard(
-                    title: date.isEmpty ? 'Journal' : date,
-                    subtitle: (narr.isNotEmpty ? '$narr • ' : '') + firstLine,
-                    onTap: () => _showJournalSheet(context, j),
-                  );
-                },
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  // Helpers
-  Iterable<Map<String, dynamic>> _topTbRows() {
-    final rows = (_tb['rows'] as List?) ?? const [];
-    return rows.take(6).cast<Map<String, dynamic>>();
-  }
-
-  String _num(dynamic v) {
-    if (v == null) return '0';
-    if (v is num) return v.toStringAsFixed(2);
-    final p = double.tryParse(v.toString());
-    return p == null ? v.toString() : p.toStringAsFixed(2);
-  }
-
-  void _showTrialBalanceSheet(BuildContext context) {
-    final rows = (_tb['rows'] as List?)?.cast<Map>() ?? const [];
-    final totals = (_tb['totals'] as Map?) ?? const {};
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      builder:
-          (_) => DraggableScrollableSheet(
-            expand: false,
-            initialChildSize: 0.8,
-            minChildSize: 0.4,
-            maxChildSize: 0.95,
-            builder:
-                (_, controller) => Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    children: [
-                      const Text(
-                        'Trial Balance',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      Expanded(
-                        child: ListView.builder(
-                          controller: controller,
-                          itemCount: rows.length,
-                          itemBuilder: (_, i) {
-                            final r = rows[i].cast<String, dynamic>();
-                            return ListTile(
-                              dense: true,
-                              title: Text(
-                                r['account']?.toString() ?? 'Account',
+                      : RefreshIndicator(
+                        onRefresh: _loadAll,
+                        child: SingleChildScrollView(
+                          physics: const AlwaysScrollableScrollPhysics(),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 6,
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Padding(
+                                padding: EdgeInsets.symmetric(
+                                  horizontal: 6,
+                                  vertical: 6,
+                                ),
+                                child: Text(
+                                  'Accounts & Reports',
+                                  style: TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.black87,
+                                  ),
+                                ),
                               ),
-                              trailing: Text(
-                                'DR ${_num(r['debit'])}  •  CR ${_num(r['credit'])}',
+                              GridView(
+                                shrinkWrap: true,
+                                physics: const NeverScrollableScrollPhysics(),
+                                gridDelegate:
+                                    const SliverGridDelegateWithFixedCrossAxisCount(
+                                      crossAxisCount: 2,
+                                      mainAxisSpacing: 10,
+                                      crossAxisSpacing: 10,
+                                      childAspectRatio: 1.45,
+                                    ),
+                                children: [
+                                  _tbCard(context),
+                                  _journalsCard(context),
+                                  ..._statementCards(context),
+                                ],
                               ),
-                            );
-                          },
-                        ),
-                      ),
-                      const Divider(),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: Padding(
-                          padding: const EdgeInsets.only(top: 4),
-                          child: Text(
-                            'Totals —  DR ${_num(totals['debit'])}  •  CR ${_num(totals['credit'])}',
-                            style: const TextStyle(fontWeight: FontWeight.w600),
+                            ],
                           ),
                         ),
                       ),
-                    ],
-                  ),
-                ),
-          ),
-    );
-  }
-
-  void _showStatementSheet(BuildContext context, Map<String, dynamic> s) {
-    final title = (s['name'] ?? 'Statement').toString();
-    final perStart = (s['period_start'] ?? '').toString();
-    final perEnd = (s['period_end'] ?? '').toString();
-    showModalBottomSheet(
-      context: context,
-      builder:
-          (_) => SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    perStart.isEmpty && perEnd.isEmpty
-                        ? 'Saved statement'
-                        : '$perStart → $perEnd',
-                  ),
-                  const SizedBox(height: 16),
-                  const Text(
-                    "Tip: Ask the assistant to export this statement to Excel or PDF (it will return download links in chat).",
-                    style: TextStyle(color: Colors.black54),
-                  ),
-                  const SizedBox(height: 8),
-                ],
-              ),
             ),
-          ),
-    );
-  }
-
-  void _showJournalSheet(BuildContext context, Map<String, dynamic> j) {
-    final date = (j['date'] ?? '').toString();
-    final narr = (j['narration'] ?? '').toString();
-    final lines = (j['lines'] as List?)?.cast<Map>() ?? const [];
-
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      builder:
-          (_) => DraggableScrollableSheet(
-            expand: false,
-            initialChildSize: 0.6,
-            maxChildSize: 0.9,
-            minChildSize: 0.4,
-            builder:
-                (_, controller) => Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    children: [
-                      Text(
-                        date.isEmpty ? 'Journal' : date,
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      if (narr.isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(narr),
-                      ],
-                      const SizedBox(height: 12),
-                      Expanded(
-                        child: ListView.separated(
-                          controller: controller,
-                          itemCount: lines.length,
-                          separatorBuilder: (_, __) => const Divider(height: 1),
-                          itemBuilder: (_, i) {
-                            final l = lines[i].cast<String, dynamic>();
-                            return ListTile(
-                              dense: true,
-                              title: Text(
-                                l['account']?.toString() ?? 'Account',
-                              ),
-                              trailing: Text(
-                                'DR ${_num(l['debit'])}  •  CR ${_num(l['credit'])}',
-                              ),
-                            );
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-          ),
-    );
-  }
-}
-
-class _Section extends StatelessWidget {
-  final String title;
-  final Widget child;
-  const _Section({required this.title, required this.child, super.key});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: 8, bottom: 8),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-            child: Text(
-              title,
-              style: const TextStyle(fontWeight: FontWeight.w600),
-            ),
-          ),
-          child,
         ],
       ),
     );
   }
+
+  // ---------------- Cards ----------------
+  Widget _tbCard(BuildContext context) {
+    final preview = _tbRows.take(6).toList();
+    final totals = _tbTotals ?? const {};
+
+    return _MiniSheetCard(
+      title: 'Trial Balance',
+      subtitle:
+          'Rows: ${_tbRows.length} • Dr ${_fmtAmt(totals['debit'])} / Cr ${_fmtAmt(totals['credit'])}',
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => WorksheetScreen.tb()),
+        );
+      },
+      child: _buildTbMiniTable(preview),
+    );
+  }
+
+  Widget _journalsCard(BuildContext context) {
+    final preview = _journals.take(3).toList();
+    return _MiniSheetCard(
+      title: 'Journals',
+      subtitle: 'Entries: ${_journals.length}',
+      onTap: () {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => WorksheetScreen.journals()),
+        );
+      },
+      child: _buildJournalsMini(preview),
+    );
+  }
+
+  List<Widget> _statementCards(BuildContext context) {
+    if (_statements.isEmpty) {
+      return [
+        _MiniSheetCard(
+          title: 'Statements',
+          subtitle: 'No statements yet',
+          onTap: () {},
+          child: const Center(
+            child: Text('Ask the AI to prepare a statement.'),
+          ),
+        ),
+      ];
+    }
+    final items = _statements.take(4).toList();
+    return items.map((m) {
+      final name = (m['name'] ?? '').toString();
+      final ver = (m['version'] ?? 1).toString();
+      final ps = (m['period_start'] ?? '').toString();
+      final pe = (m['period_end'] ?? '').toString();
+      final id = (m['id'] ?? 0) as int;
+
+      return _MiniSheetCard(
+        title: name.isEmpty ? 'Statement' : name,
+        subtitle: [
+          if (ps.isNotEmpty || pe.isNotEmpty) '$ps → $pe',
+          'v$ver',
+        ].where((s) => s.isNotEmpty).join('  •  '),
+        onTap: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => WorksheetScreen.statement(id: id, name: name),
+            ),
+          );
+        },
+        child: Padding(
+          padding: const EdgeInsets.all(8.0),
+          child: Text(
+            'Tap to open full statement',
+            style: TextStyle(color: Colors.grey[700]),
+          ),
+        ),
+      );
+    }).toList();
+  }
+
+  // ---------------- Mini renderers ----------------
+  Widget _buildTbMiniTable(List<Map<String, dynamic>> rows) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        columns: const [
+          DataColumn(label: Text('Account')),
+          DataColumn(label: Text('Debit')),
+          DataColumn(label: Text('Credit')),
+        ],
+        rows:
+            rows
+                .map(
+                  (r) => DataRow(
+                    cells: [
+                      DataCell(Text((r['account'] ?? '').toString())),
+                      DataCell(Text(_fmtAmt(r['debit']))),
+                      DataCell(Text(_fmtAmt(r['credit']))),
+                    ],
+                  ),
+                )
+                .toList(),
+      ),
+    );
+  }
+
+  Widget _buildJournalsMini(List<Map<String, dynamic>> entries) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      child: DataTable(
+        columns: const [
+          DataColumn(label: Text('Date')),
+          DataColumn(label: Text('Narration & Lines')),
+        ],
+        rows:
+            entries.map((e) {
+              final date = (e['date'] ?? '').toString();
+              final narration = (e['narration'] ?? '').toString();
+              final lines =
+                  (e['lines'] as List? ?? const [])
+                      .cast<Map>()
+                      .map((m) => Map<String, dynamic>.from(m as Map))
+                      .toList();
+
+              final lineTxt = lines
+                  .take(2)
+                  .map((l) {
+                    final acc = (l['account'] ?? '').toString();
+                    final dr = (l['debit'] ?? 0).toString();
+                    final cr = (l['credit'] ?? 0).toString();
+                    return '$acc (Dr $dr / Cr $cr)';
+                  })
+                  .join(' · ');
+
+              return DataRow(
+                cells: [
+                  DataCell(Text(date)),
+                  DataCell(
+                    Text(
+                      narration.isEmpty ? lineTxt : '$narration — $lineTxt',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              );
+            }).toList(),
+      ),
+    );
+  }
+
+  String _fmtAmt(dynamic v) {
+    if (v == null) return '0.00';
+    try {
+      final n = v is num ? v.toDouble() : double.parse(v.toString());
+      return n.toStringAsFixed(2);
+    } catch (_) {
+      return v.toString();
+    }
+  }
 }
 
-class _TileCard extends StatelessWidget {
+class _MiniSheetCard extends StatelessWidget {
   final String title;
-  final String subtitle;
+  final String? subtitle;
+  final Widget child;
   final VoidCallback? onTap;
-  const _TileCard({
+
+  const _MiniSheetCard({
     required this.title,
-    required this.subtitle,
+    this.subtitle,
+    required this.child,
     this.onTap,
-    super.key,
   });
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 260,
+    return Card(
+      elevation: 0.3,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      color: Colors.grey.shade50,
       child: InkWell(
+        borderRadius: BorderRadius.circular(12),
         onTap: onTap,
-        child: Card(
-          elevation: 0.5,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-                const SizedBox(height: 6),
-                Expanded(
-                  child: Text(
-                    subtitle,
-                    maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(color: Colors.grey[700]),
-                  ),
-                ),
-                const SizedBox(height: 6),
-                const Row(
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // title + subtitle
+              Padding(
+                padding: const EdgeInsets.only(bottom: 6),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Icon(Icons.arrow_forward_ios, size: 14),
-                    SizedBox(width: 4),
-                    Text('Open', style: TextStyle(fontSize: 12)),
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 14,
+                      ),
+                    ),
+                    if ((subtitle ?? '').isNotEmpty)
+                      Text(
+                        subtitle!,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Colors.black54,
+                        ),
+                      ),
                   ],
                 ),
-              ],
-            ),
+              ),
+              const Divider(height: 10),
+              Expanded(
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 2),
+                  child: child,
+                ),
+              ),
+            ],
           ),
         ),
       ),
