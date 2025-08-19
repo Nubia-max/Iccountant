@@ -1,11 +1,23 @@
+import 'dart:convert';
+
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
 import 'package:taxpal/chatbot/service/ChatService.dart';
 import 'package:taxpal/books/worksheet_screen.dart';
+
+/// Same base as elsewhere (main.dart / chat_screen.dart).
+const String API_BASE = String.fromEnvironment(
+  'API_BASE',
+  defaultValue: 'http://127.0.0.1:8000',
+);
 
 /// Collapsible drawer that shows mini "worksheet" previews:
 /// - Trial Balance (mini table)
 /// - Journals (recent summary)
-/// - Statements (cards)
+/// - Statements (tap opens a GRID viewer if content.type == "grid")
+/// - Quick Ledger (open any account as a grid sheet)
 class IccountantDrawer extends StatefulWidget {
   const IccountantDrawer({super.key});
 
@@ -142,6 +154,7 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
                                 children: [
                                   _tbCard(context),
                                   _journalsCard(context),
+                                  _quickLedgerCard(context),
                                   ..._statementCards(context),
                                 ],
                               ),
@@ -189,6 +202,79 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
     );
   }
 
+  Widget _quickLedgerCard(BuildContext context) {
+    return _MiniSheetCard(
+      title: 'Quick Ledger',
+      subtitle: 'Open any account as a sheet',
+      onTap: () async {
+        final controller = TextEditingController();
+        final startCtl = TextEditingController();
+        final endCtl = TextEditingController();
+        final params = await showDialog<String>(
+          context: context,
+          builder:
+              (_) => AlertDialog(
+                title: const Text('Open Ledger'),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: controller,
+                      decoration: const InputDecoration(
+                        hintText: 'e.g. Cash, Bank, Tunde',
+                        labelText: 'Account name',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: startCtl,
+                      decoration: const InputDecoration(
+                        hintText: 'YYYY-MM-DD',
+                        labelText: 'Start (optional)',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: endCtl,
+                      decoration: const InputDecoration(
+                        hintText: 'YYYY-MM-DD',
+                        labelText: 'End (optional)',
+                      ),
+                    ),
+                  ],
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('Cancel'),
+                  ),
+                  ElevatedButton(
+                    onPressed:
+                        () => Navigator.pop(
+                          context,
+                          jsonEncode({
+                            "account": controller.text.trim(),
+                            "start": startCtl.text.trim(),
+                            "end": endCtl.text.trim(),
+                          }),
+                        ),
+                    child: const Text('Open'),
+                  ),
+                ],
+              ),
+        );
+        if (params == null || params.isEmpty) return;
+        final args = jsonDecode(params) as Map<String, dynamic>;
+        await _openLedgerScreen(
+          account: (args['account'] ?? '').toString(),
+          start: (args['start'] ?? '').toString(),
+          end: (args['end'] ?? '').toString(),
+        );
+      },
+      child: const Center(child: Text('Tap to choose account')),
+    );
+  }
+
   List<Widget> _statementCards(BuildContext context) {
     if (_statements.isEmpty) {
       return [
@@ -216,14 +302,7 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
           if (ps.isNotEmpty || pe.isNotEmpty) '$ps → $pe',
           'v$ver',
         ].where((s) => s.isNotEmpty).join('  •  '),
-        onTap: () {
-          Navigator.push(
-            context,
-            MaterialPageRoute(
-              builder: (_) => WorksheetScreen.statement(id: id, name: name),
-            ),
-          );
-        },
+        onTap: () => _openStatementDetail(id: id, fallbackName: name),
         child: Padding(
           padding: const EdgeInsets.all(8.0),
           child: Text(
@@ -306,6 +385,7 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
     );
   }
 
+  // ---------------- Helpers ----------------
   String _fmtAmt(dynamic v) {
     if (v == null) return '0.00';
     try {
@@ -313,6 +393,118 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
       return n.toStringAsFixed(2);
     } catch (_) {
       return v.toString();
+    }
+  }
+
+  Future<void> _openLedgerScreen({
+    required String account,
+    String? start,
+    String? end,
+  }) async {
+    if (account.trim().isEmpty) return;
+    try {
+      final tok = await FirebaseAuth.instance.currentUser?.getIdToken();
+      final uri = Uri.parse('$API_BASE/ledger').replace(
+        queryParameters: {
+          'account': account,
+          if ((start ?? '').isNotEmpty) 'start': start!,
+          if ((end ?? '').isNotEmpty) 'end': end!,
+        },
+      );
+      final res = await http.get(
+        uri,
+        headers: {
+          'Accept': 'application/json',
+          if (tok != null) 'Authorization': 'Bearer $tok',
+        },
+      );
+      if (res.statusCode != 200) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Ledger error: ${res.statusCode}')),
+        );
+        return;
+      }
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder:
+              (_) => _GridSheetScreen(
+                title: 'Ledger — ${body['name'] ?? account}',
+                grid: body,
+              ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Ledger error: $e')));
+    }
+  }
+
+  Future<void> _openStatementDetail({
+    required int id,
+    required String fallbackName,
+  }) async {
+    try {
+      final tok = await FirebaseAuth.instance.currentUser?.getIdToken();
+      final res = await http.get(
+        Uri.parse('$API_BASE/statements/$id'),
+        headers: {
+          'Accept': 'application/json',
+          if (tok != null) 'Authorization': 'Bearer $tok',
+        },
+      );
+      if (res.statusCode != 200) {
+        if (!mounted) return;
+        // Fallback to existing screen if available
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder:
+                (_) => WorksheetScreen.statement(id: id, name: fallbackName),
+          ),
+        );
+        return;
+      }
+      final body = jsonDecode(res.body) as Map<String, dynamic>;
+      final content = body['content'];
+      final name = (body['name'] ?? fallbackName).toString();
+
+      if (content is Map && (content['type'] ?? '') == 'grid') {
+        if (!mounted) return;
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder:
+                (_) => _GridSheetScreen(
+                  title: name,
+                  grid: Map<String, dynamic>.from(content),
+                ),
+          ),
+        );
+        return;
+      }
+
+      // Fallback: open the generic statement screen you already have
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => WorksheetScreen.statement(id: id, name: name),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => WorksheetScreen.statement(id: id, name: fallbackName),
+        ),
+      );
     }
   }
 }
@@ -376,6 +568,61 @@ class _MiniSheetCard extends StatelessWidget {
                 ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Simple full-screen renderer for a `content.type == "grid"` payload.
+class _GridSheetScreen extends StatelessWidget {
+  final String title;
+  final Map<String, dynamic> grid;
+
+  const _GridSheetScreen({required this.title, required this.grid});
+
+  @override
+  Widget build(BuildContext context) {
+    final cols =
+        (grid['columns'] as List? ?? const [])
+            .map((c) => Map<String, dynamic>.from(c as Map))
+            .toList();
+    final rows =
+        (grid['rows'] as List? ?? const [])
+            .map((r) => Map<String, dynamic>.from(r as Map))
+            .toList();
+
+    return Scaffold(
+      appBar: AppBar(title: Text(title)),
+      body: Scrollbar(
+        thumbVisibility: true,
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(minWidth: 700),
+            child: Scrollbar(
+              thumbVisibility: true,
+              child: SingleChildScrollView(
+                child: DataTable(
+                  columns: [
+                    for (final c in cols)
+                      DataColumn(
+                        label: Text((c['label'] ?? c['key']).toString()),
+                      ),
+                  ],
+                  rows: [
+                    for (final r in rows)
+                      DataRow(
+                        cells: [
+                          for (final c in cols)
+                            DataCell(Text('${r[c['key']]}')),
+                        ],
+                      ),
+                  ],
+                ),
+              ),
+            ),
           ),
         ),
       ),
