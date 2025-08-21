@@ -1,16 +1,18 @@
 // lib/widgets/iccountant_drawer.dart
-// Dynamic, LLM-driven drawer that lists Google Sheets “books” and opens them in a WebView.
-//
-// Requires ChatService + showGoogleSheetBottomSheet().
+// Dynamic drawer that lists Google Sheets “books” with a live mini preview.
+// On web: opens the Sheet in a NEW TAB. On mobile: shows an in-app WebView bottom sheet.
 
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
+
 import 'package:taxpal/chatbot/service/ChatService.dart';
-import 'package:taxpal/widgets/google_sheet_view.dart';
+import 'package:taxpal/widgets/google_sheet_view.dart'; // used on mobile only
 
 class IccountantDrawer extends StatefulWidget {
   const IccountantDrawer({super.key});
 
-  /// Expose a single global key so ChatScreen can call openFromChat2().
   static final GlobalKey<_IccountantDrawerState> globalKey =
       GlobalKey<_IccountantDrawerState>();
 
@@ -67,21 +69,33 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
     for (var i = 0; i < maxAuto; i++) {
       final bk = toOpen[i];
       if (bk.sheetUrl.isEmpty) continue;
-      await showGoogleSheetBottomSheet(
-        context,
-        title: bk.name,
-        sheetUrl: bk.sheetUrl,
-      );
+      await _openSheet(context, bk.name, bk.sheetUrl);
     }
 
     await _loadBooks();
   }
 
+  Future<void> _openSheet(
+    BuildContext context,
+    String title,
+    String sheetUrl,
+  ) async {
+    if (kIsWeb) {
+      // Web: open in a NEW TAB (never same tab)
+      await launchUrl(Uri.parse(sheetUrl), webOnlyWindowName: '_blank');
+    } else {
+      // Mobile/Desktop: keep your in-app WebView bottom sheet
+      await showGoogleSheetBottomSheet(
+        context,
+        title: title,
+        sheetUrl: sheetUrl,
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return AnimatedContainer(
-      // IMPORTANT: do NOT use the globalKey again here.
-      // If you want a key for this box, use a ValueKey instead.
       // key: const ValueKey('iccountant_drawer_box'),
       duration: const Duration(milliseconds: 200),
       decoration: BoxDecoration(
@@ -163,7 +177,16 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
                                     ),
                                 itemCount: _books.length,
                                 itemBuilder:
-                                    (context, i) => _BookCard(book: _books[i]),
+                                    (context, i) => _BookCard(
+                                      book: _books[i],
+                                      onOpen:
+                                          (bk) => _openSheet(
+                                            context,
+                                            bk.name,
+                                            bk.sheetUrl,
+                                          ),
+                                      svc: _svc,
+                                    ),
                               ),
                             ],
                           ),
@@ -181,7 +204,6 @@ class _EmptyBooks extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Compact placeholder to avoid overflow in short containers
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(12.0),
@@ -197,7 +219,14 @@ class _EmptyBooks extends StatelessWidget {
 
 class _BookCard extends StatelessWidget {
   final BookRef book;
-  const _BookCard({required this.book});
+  final ChatService svc;
+  final void Function(BookRef) onOpen;
+
+  const _BookCard({
+    required this.book,
+    required this.svc,
+    required this.onOpen,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -213,14 +242,7 @@ class _BookCard extends StatelessWidget {
       color: Colors.grey.shade50,
       child: InkWell(
         borderRadius: BorderRadius.circular(12),
-        onTap: () async {
-          if (book.sheetUrl.isEmpty) return;
-          await showGoogleSheetBottomSheet(
-            context,
-            title: book.name,
-            sheetUrl: book.sheetUrl,
-          );
-        },
+        onTap: () => onOpen(book),
         child: Padding(
           padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
           child: Column(
@@ -252,13 +274,52 @@ class _BookCard extends StatelessWidget {
                   style: const TextStyle(fontSize: 12, color: Colors.black54),
                 ),
               const Divider(height: 12),
+
+              // --- PREVIEW AREA ---
               Expanded(
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    'Tap to edit in Google Sheets',
-                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
-                  ),
+                child: FutureBuilder<Uint8List?>(
+                  future: svc.fetchBookThumbnail(book.sheetId, width: 720),
+                  builder: (context, snap) {
+                    if (snap.connectionState == ConnectionState.waiting) {
+                      return const _PreviewSkeleton();
+                    }
+                    if (snap.hasData && snap.data != null) {
+                      return ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.memory(
+                          snap.data!,
+                          fit: BoxFit.cover,
+                          width: double.infinity,
+                        ),
+                      );
+                    }
+                    // Fallback to a tiny grid if no thumbnail
+                    return FutureBuilder<List<List<String>>>(
+                      future: svc.fetchBookValues(
+                        book.sheetId,
+                        range: 'A1:F10',
+                      ),
+                      builder: (context, vSnap) {
+                        if (vSnap.connectionState == ConnectionState.waiting) {
+                          return const _PreviewSkeleton();
+                        }
+                        final rows = vSnap.data ?? const [];
+                        if (rows.isEmpty) {
+                          return Align(
+                            alignment: Alignment.centerLeft,
+                            child: Text(
+                              'Tap to edit in Google Sheets',
+                              style: TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey.shade700,
+                              ),
+                            ),
+                          );
+                        }
+                        return _MiniGrid(values: rows);
+                      },
+                    );
+                  },
                 ),
               ),
             ],
@@ -274,5 +335,70 @@ class _BookCard extends StatelessWidget {
     if (d.inMinutes < 60) return '${d.inMinutes}m ago';
     if (d.inHours < 24) return '${d.inHours}h ago';
     return '${d.inDays}d ago';
+  }
+}
+
+class _PreviewSkeleton extends StatelessWidget {
+  const _PreviewSkeleton();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.grey.shade200,
+        borderRadius: BorderRadius.circular(8),
+      ),
+    );
+  }
+}
+
+class _MiniGrid extends StatelessWidget {
+  final List<List<String>> values;
+  const _MiniGrid({required this.values});
+
+  @override
+  Widget build(BuildContext context) {
+    final maxCols = values
+        .fold<int>(0, (m, r) => r.length > m ? r.length : m)
+        .clamp(1, 8);
+    final maxRows = values.length.clamp(1, 12);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        decoration: BoxDecoration(border: Border.all(color: Colors.black12)),
+        child: ListView.builder(
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: maxRows,
+          itemBuilder: (ctx, r) {
+            final row = (r < values.length) ? values[r] : const <String>[];
+            return Row(
+              children: List.generate(maxCols, (c) {
+                final txt = (c < row.length) ? row[c] : '';
+                return Expanded(
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 6,
+                      vertical: 4,
+                    ),
+                    decoration: const BoxDecoration(
+                      border: Border(
+                        right: BorderSide(color: Colors.black12),
+                        bottom: BorderSide(color: Colors.black12),
+                      ),
+                    ),
+                    child: Text(
+                      txt,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 11),
+                    ),
+                  ),
+                );
+              }),
+            );
+          },
+        ),
+      ),
+    );
   }
 }

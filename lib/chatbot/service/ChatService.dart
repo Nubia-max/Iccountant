@@ -1,17 +1,13 @@
 // lib/chatbot/service/ChatService.dart
-// Dynamic service used by ChatScreen + IccountantDrawer.
-// Adds:
-//  - BookRef model
-//  - Chat2Response.openBooks
-//  - listBooks() to fetch dynamic books
-//  - booksToAutoOpen() to decide which books to open after /chat2
-//
-// Expects backend shapes like:
-//   GET /books -> [{ name, sheet_url, kind?, updated_at? }, ...]
-//   POST /chat2 -> { assistant_message, ephemeral_message?, posted_actions?:[],
-//                    open_books?: [{...}], ... }
+// Service used by ChatScreen + IccountantDrawer.
+// - BookRef now includes sheetId
+// - Chat2Response.openBooks parsed with sheet_id
+// - listBooks() pulls dynamic list from backend
+// - booksToAutoOpen() chooses which to open after /chat2
+// - fetchBookThumbnail()/fetchBookValues() power drawer previews
 
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -23,13 +19,15 @@ const String _API_BASE = String.fromEnvironment(
 
 class BookRef {
   final String name;
-  final String sheetUrl; // full Google Sheets editor URL
-  final String? kind; // e.g. "journal", "ledger", "trial_balance" OR custom
+  final String sheetUrl; // full Google Sheets URL
+  final String sheetId; // fileId for previews (thumbnail/values)
+  final String? kind; // e.g. "journal", "ledger", etc.
   final DateTime? updatedAt;
 
   BookRef({
     required this.name,
     required this.sheetUrl,
+    required this.sheetId,
     this.kind,
     this.updatedAt,
   });
@@ -47,10 +45,12 @@ class BookRef {
     return BookRef(
       name: (m['name'] ?? 'Sheet').toString(),
       sheetUrl: (m['sheet_url'] ?? '').toString(),
+      sheetId: (m['sheet_id'] ?? '').toString(),
       kind:
-          (m['kind'] ?? '').toString().trim().isEmpty
-              ? null
-              : (m['kind'] as String),
+          (() {
+            final k = (m['kind'] ?? '').toString().trim();
+            return k.isEmpty ? null : k;
+          })(),
       updatedAt: _parseDt(m['updated_at']),
     );
   }
@@ -64,7 +64,7 @@ class Chat2Response {
   final List<int> appendedJournalIds;
   final String? ephemeralMessage;
 
-  /// New: dynamic books the assistant suggests opening (Google Sheets)
+  /// Dynamic books the assistant suggests opening (Google Sheets).
   final List<BookRef> openBooks;
 
   Chat2Response({
@@ -118,7 +118,7 @@ class ChatService {
   // Endpoints
   static const _chat2 = '/chat2';
   static const _messagesPath = '/messages';
-  static const _booksPath = '/books'; // NEW
+  static const _booksPath = '/books';
 
   // ---------------- Auth helpers ----------------
   Future<String?> _freshIdToken() async {
@@ -245,6 +245,46 @@ class ChatService {
     // Fallback: open the latest couple of books (if any)
     final recent = await listBooks(limit: 2, recent: true);
     return recent.where((b) => b.sheetUrl.isNotEmpty).toList();
+  }
+
+  // ---------------- Preview helpers (for drawer) ----------------
+
+  /// Returns a JPEG/PNG thumbnail (or null if Drive has none).
+  Future<Uint8List?> fetchBookThumbnail(
+    String sheetId, {
+    int width = 640,
+  }) async {
+    final uri = Uri.parse('$_apiBase$_booksPath/$sheetId/thumbnail?w=$width');
+    try {
+      final res = await http.get(uri, headers: await _authHeaders());
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        return Uint8List.fromList(res.bodyBytes);
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  /// Returns a tiny grid of cell values for preview (A1:F12 by default).
+  Future<List<List<String>>> fetchBookValues(
+    String sheetId, {
+    String range = 'A1:F12',
+  }) async {
+    final uri = Uri.parse(
+      '$_apiBase$_booksPath/$sheetId/values',
+    ).replace(queryParameters: {'rng': range});
+    try {
+      final res = await http.get(uri, headers: await _authHeaders());
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        final m = jsonDecode(res.body);
+        final vals = (m['values'] as List?) ?? const [];
+        return vals
+            .map<List<String>>(
+              (row) => (row as List).map((c) => c?.toString() ?? '').toList(),
+            )
+            .toList();
+      }
+    } catch (_) {}
+    return const <List<String>>[];
   }
 
   // ---------------- Helpers ----------------
