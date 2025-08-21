@@ -1,31 +1,59 @@
 // lib/main.dart
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 
 import 'firebase_options.dart';
-import 'auth/login_screen.dart';
+
+// Auth DI
+import 'package:taxpal/auth/controller/auth_controller.dart';
+import 'package:taxpal/auth/repository/auth_repository.dart';
+
+// UI
+import 'package:taxpal/auth/screens/login_screen.dart';
 import 'chatbot/screens/chat_screen.dart';
 
-/// Same env var used by services.
+// Google connect helper (used to nudge user on web)
+import 'package:taxpal/services/google_connect_service.dart';
+
 const String API_BASE = String.fromEnvironment(
   'API_BASE',
   defaultValue: 'http://127.0.0.1:8000',
 );
 
+// Your Google OAuth **Web** Client ID (from Google Cloud Console)
+const String GOOGLE_WEB_CLIENT_ID =
+    '425676843416-4ir8pg0gi3g8b0e1nqdmnlf2h30vbqga.apps.googleusercontent.com';
+
+Future<void> _setupDI() async {
+  final repo = AuthRepository(
+    apiBase: API_BASE,
+    serverClientId: GOOGLE_WEB_CLIENT_ID,
+  );
+  Get.put<AuthRepository>(repo, permanent: true);
+  Get.put<AuthController>(
+    AuthController(authRepository: repo),
+    permanent: true,
+  );
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  await _setupDI();
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
-    final initial =
-        FirebaseAuth.instance.currentUser == null ? '/login' : '/home';
-    return MaterialApp(
+    final initial = FirebaseAuth.instance.currentUser == null ? '/login' : '/';
+
+    return GetMaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'Iccountant',
       theme: ThemeData(
@@ -33,13 +61,18 @@ class MyApp extends StatelessWidget {
         scaffoldBackgroundColor: Colors.white,
       ),
       initialRoute: initial,
-      routes: {
-        '/login':
-            (ctx) => LoginScreen(
-              onLoggedIn: () => Navigator.pushReplacementNamed(ctx, '/home'),
-            ),
-        '/home': (ctx) => const MyHomePage(),
-      },
+      getPages: [
+        GetPage(name: '/login', page: () => const LoginScreen()),
+        GetPage(name: '/', page: () => const MyHomePage()),
+        // Optional placeholder in case you enable a Terms/EULA gate later.
+        GetPage(
+          name: '/terms',
+          page:
+              () => const Scaffold(
+                body: Center(child: Text('Terms of Service (placeholder)')),
+              ),
+        ),
+      ],
     );
   }
 }
@@ -50,17 +83,49 @@ class MyHomePage extends StatefulWidget {
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
-// Your original layout, with a Firebase-powered avatar at the bottom.
+// Sidebar layout with avatar. Long-press avatar to sign out.
 class _MyHomePageState extends State<MyHomePage> {
   User? _user;
+  late final GoogleConnectService _gsvc;
 
   @override
   void initState() {
     super.initState();
+    _gsvc = GoogleConnectService(baseUrl: API_BASE);
+
     _user = FirebaseAuth.instance.currentUser;
-    FirebaseAuth.instance.authStateChanges().listen((u) {
+    FirebaseAuth.instance.authStateChanges().listen((u) async {
       if (!mounted) return;
       setState(() => _user = u);
+
+      // On web, after sign-in, gently prompt once to connect Google Drive
+      // so the backend can create Sheets on the user's behalf.
+      if (kIsWeb && u != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          final connected = await _gsvc.status();
+          if (!connected && mounted) {
+            final sb = SnackBar(
+              content: const Text(
+                'Connect Google Drive to let Iccountant create Sheets.',
+              ),
+              action: SnackBarAction(
+                label: 'Connect',
+                onPressed: () async {
+                  await _gsvc.connect(context);
+                  final ok = await _gsvc.status();
+                  if (ok && mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Google connected!')),
+                    );
+                  }
+                },
+              ),
+              duration: const Duration(seconds: 10),
+            );
+            ScaffoldMessenger.of(context).showSnackBar(sb);
+          }
+        });
+      }
     });
   }
 
@@ -99,8 +164,7 @@ class _MyHomePageState extends State<MyHomePage> {
         child: GestureDetector(
           onLongPress: () async {
             await FirebaseAuth.instance.signOut();
-            if (!mounted) return;
-            Navigator.pushReplacementNamed(context, '/login');
+            // GetX navigation is handled by AuthController on auth changes.
           },
           child: CircleAvatar(
             radius: 18,

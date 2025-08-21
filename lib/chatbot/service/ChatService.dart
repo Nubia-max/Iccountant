@@ -1,32 +1,124 @@
+// lib/chatbot/service/ChatService.dart
+// Dynamic service used by ChatScreen + IccountantDrawer.
+// Adds:
+//  - BookRef model
+//  - Chat2Response.openBooks
+//  - listBooks() to fetch dynamic books
+//  - booksToAutoOpen() to decide which books to open after /chat2
+//
+// Expects backend shapes like:
+//   GET /books -> [{ name, sheet_url, kind?, updated_at? }, ...]
+//   POST /chat2 -> { assistant_message, ephemeral_message?, posted_actions?:[],
+//                    open_books?: [{...}], ... }
+
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
-/// ChatService: talks to FastAPI with Firebase auth.
-/// - Uses Firebase ID token in Authorization header
-/// - Keeps a simple "default" conversation id locally
-/// - Exposes helpers for chat, messages, journals, statements, trial balance
+const String _API_BASE = String.fromEnvironment(
+  'API_BASE',
+  defaultValue: 'http://127.0.0.1:8000',
+);
+
+class BookRef {
+  final String name;
+  final String sheetUrl; // full Google Sheets editor URL
+  final String? kind; // e.g. "journal", "ledger", "trial_balance" OR custom
+  final DateTime? updatedAt;
+
+  BookRef({
+    required this.name,
+    required this.sheetUrl,
+    this.kind,
+    this.updatedAt,
+  });
+
+  factory BookRef.fromJson(Map<String, dynamic> m) {
+    DateTime? _parseDt(dynamic v) {
+      if (v == null) return null;
+      try {
+        return DateTime.parse(v.toString()).toLocal();
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return BookRef(
+      name: (m['name'] ?? 'Sheet').toString(),
+      sheetUrl: (m['sheet_url'] ?? '').toString(),
+      kind:
+          (m['kind'] ?? '').toString().trim().isEmpty
+              ? null
+              : (m['kind'] as String),
+      updatedAt: _parseDt(m['updated_at']),
+    );
+  }
+}
+
+class Chat2Response {
+  final String assistantMessage;
+  final List<String> postedActions;
+  final List<String> warnings;
+  final List<int> createdStatementIds;
+  final List<int> appendedJournalIds;
+  final String? ephemeralMessage;
+
+  /// New: dynamic books the assistant suggests opening (Google Sheets)
+  final List<BookRef> openBooks;
+
+  Chat2Response({
+    required this.assistantMessage,
+    required this.postedActions,
+    required this.warnings,
+    required this.createdStatementIds,
+    required this.appendedJournalIds,
+    required this.ephemeralMessage,
+    required this.openBooks,
+  });
+
+  factory Chat2Response.fromJson(Map<String, dynamic> m) {
+    List<T> _list<T>(dynamic v, T Function(dynamic) map) {
+      if (v is List) return v.map(map).toList();
+      return <T>[];
+    }
+
+    final openBooks = _list<BookRef>(m['open_books'], (e) {
+      return BookRef.fromJson(Map<String, dynamic>.from(e as Map));
+    });
+
+    return Chat2Response(
+      assistantMessage:
+          (m['assistant_message'] ?? m['message'] ?? 'Done.').toString(),
+      postedActions: _list<String>(
+        m['posted_actions'],
+        (e) => e?.toString() ?? '',
+      ),
+      warnings: _list<String>(m['warnings'], (e) => e?.toString() ?? ''),
+      createdStatementIds: _list<int>(
+        m['created_statement_ids'],
+        (e) => e as int? ?? 0,
+      ),
+      appendedJournalIds: _list<int>(
+        m['appended_journal_ids'],
+        (e) => e as int? ?? 0,
+      ),
+      ephemeralMessage: (m['ephemeral_message'] ?? m['ephemeral'])?.toString(),
+      openBooks: openBooks,
+    );
+  }
+}
+
 class ChatService {
-  ChatService({String? apiBase, String? openAiKey})
-    : _apiBase =
-          (apiBase == null || apiBase.isEmpty)
-              ? const String.fromEnvironment(
-                'API_BASE',
-                defaultValue: 'http://127.0.0.1:8000',
-              )
-              : apiBase,
-      _key = openAiKey;
+  ChatService({String? apiBase})
+    : _apiBase = (apiBase == null || apiBase.isEmpty) ? _API_BASE : apiBase;
 
   final String _apiBase;
-  final String? _key;
 
   // Endpoints
   static const _chat2 = '/chat2';
   static const _messagesPath = '/messages';
-  static const _journalsPath = '/journals';
-  static const _tbSummaryPath = '/trial_balance/summary';
-  static const _statementsPath = '/statements';
+  static const _booksPath = '/books'; // NEW
 
   // ---------------- Auth helpers ----------------
   Future<String?> _freshIdToken() async {
@@ -55,38 +147,56 @@ class ChatService {
   }
 
   // ---------------- Chat ----------------
-  Future<String> handlePrompt(
-    List<Map<String, dynamic>> _,
-    String input,
-  ) async {
+  Future<Chat2Response> chat2(String input) async {
     final convId = await ensureActiveConversation();
     final uri = Uri.parse('$_apiBase$_chat2');
-    try {
-      final res = await http.post(
-        uri,
-        headers: await _authHeaders(
-          base: const {'Content-Type': 'application/json'},
-        ),
-        body: jsonEncode({'conversation_id': convId, 'message': input}),
-      );
-      if (res.statusCode == 200) {
-        final body = _safeJson(res.body);
-        final msg =
-            (body['assistant_message'] ?? body['message'] ?? '').toString();
-        return msg.isEmpty ? 'Done.' : msg;
-      }
-      if (res.statusCode == 400) {
-        final body = _safeJson(res.body);
-        return (body['error'] ?? body['message'] ?? 'I need a bit more info.')
-            .toString();
-      }
-      if (res.statusCode == 401) {
-        return 'You are not signed in. Please sign in again.';
-      }
-      return 'Backend error ${res.statusCode}';
-    } catch (e) {
-      return 'Network error: $e';
+    final res = await http.post(
+      uri,
+      headers: await _authHeaders(
+        base: const {'Content-Type': 'application/json'},
+      ),
+      body: jsonEncode({'conversation_id': convId, 'message': input}),
+    );
+
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      return Chat2Response.fromJson(_safeJson(res.body));
     }
+
+    // Shape errors into a consistent response
+    if (res.statusCode == 401) {
+      return Chat2Response(
+        assistantMessage: 'You are not signed in. Please login again.',
+        postedActions: const [],
+        warnings: const [],
+        createdStatementIds: const [],
+        appendedJournalIds: const [],
+        ephemeralMessage: null,
+        openBooks: const [],
+      );
+    }
+    if (res.statusCode == 400) {
+      final m = _safeJson(res.body);
+      return Chat2Response(
+        assistantMessage:
+            (m['error'] ?? m['message'] ?? 'I need a bit more info.')
+                .toString(),
+        postedActions: const [],
+        warnings: const [],
+        createdStatementIds: const [],
+        appendedJournalIds: const [],
+        ephemeralMessage: null,
+        openBooks: const [],
+      );
+    }
+    return Chat2Response(
+      assistantMessage: 'Backend error ${res.statusCode}',
+      postedActions: const [],
+      warnings: const [],
+      createdStatementIds: const [],
+      appendedJournalIds: const [],
+      ephemeralMessage: null,
+      openBooks: const [],
+    );
   }
 
   Future<List<Map<String, dynamic>>> fetchMessages(
@@ -97,7 +207,7 @@ class ChatService {
     );
     try {
       final res = await http.get(uri, headers: await _authHeaders());
-      if (res.statusCode == 200) {
+      if (res.statusCode >= 200 && res.statusCode < 300) {
         final v = jsonDecode(res.body);
         if (v is List) {
           return v.cast<Map>().map((e) => e.cast<String, dynamic>()).toList();
@@ -107,75 +217,34 @@ class ChatService {
     return <Map<String, dynamic>>[];
   }
 
-  // ---------------- Drawer data ----------------
-  /// Returns: { rows: [ {account,debit,credit}... ], totals:{debit,credit} }
-  Future<Map<String, dynamic>> trialBalance() async {
-    final uri = Uri.parse('$_apiBase$_tbSummaryPath');
-    final res = await http.get(uri, headers: await _authHeaders());
-    if (res.statusCode == 200) {
-      return _safeJson(res.body);
-    }
-    if (res.statusCode == 401) {
-      return {'error': 'unauthorized'};
-    }
-    return {'error': 'status_${res.statusCode}'};
-  }
-
-  Future<List<Map<String, dynamic>>> listJournals({
-    int limit = 20,
-    int offset = 0,
-  }) async {
-    final uri = Uri.parse(
-      '$_apiBase$_journalsPath?limit=$limit&offset=$offset',
-    );
-    final res = await http.get(uri, headers: await _authHeaders());
-    if (res.statusCode == 200) {
-      final v = jsonDecode(res.body);
-      if (v is List) {
-        return v.cast<Map>().map((e) => e.cast<String, dynamic>()).toList();
-      }
-    }
-    return [];
-  }
-
-  Future<List<Map<String, dynamic>>> listStatements({
-    int limit = 50,
-    String? name,
-  }) async {
+  // ---------------- Dynamic books ----------------
+  Future<List<BookRef>> listBooks({int limit = 50, bool recent = true}) async {
     final qp = <String, String>{'limit': '$limit'};
-    if (name != null && name.isNotEmpty) qp['name'] = name;
-    final uri = Uri.parse(
-      '$_apiBase$_statementsPath',
-    ).replace(queryParameters: qp);
+    if (recent) qp['recent'] = 'true';
+    final uri = Uri.parse('$_apiBase$_booksPath').replace(queryParameters: qp);
     final res = await http.get(uri, headers: await _authHeaders());
-    if (res.statusCode == 200) {
+    if (res.statusCode >= 200 && res.statusCode < 300) {
       final v = jsonDecode(res.body);
       if (v is List) {
-        return v.cast<Map>().map((e) => e.cast<String, dynamic>()).toList();
+        return v
+            .cast<Map>()
+            .map((e) => BookRef.fromJson(e.cast<String, dynamic>()))
+            .toList();
       }
     }
-    return [];
+    return const <BookRef>[];
   }
 
-  // ---------------- Optional images (safe stub) ----------------
-  Future<List<String>> generateImages(String prompt) async {
-    if (_key == null || _key!.isEmpty) return <String>[];
-    try {
-      final res = await http.post(
-        Uri.parse('https://api.openai.com/v1/images/generations'),
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer $_key',
-        },
-        body: jsonEncode({"model": "dall-e-3", "prompt": prompt, "n": 1}),
-      );
-      if (res.statusCode == 200) {
-        final body = jsonDecode(res.body);
-        final List data = (body['data'] as List?) ?? const [];
-        return data.map((e) => (e as Map)['url'] as String).toList();
-      }
-    } catch (_) {}
-    return <String>[];
+  /// Decide which books to open after /chat2:
+  /// 1) Prefer explicit `open_books` from chat2
+  /// 2) Else, fallback to a couple of recent books
+  Future<List<BookRef>> booksToAutoOpen(Chat2Response out) async {
+    if (out.openBooks.isNotEmpty) {
+      return out.openBooks.where((b) => b.sheetUrl.isNotEmpty).toList();
+    }
+    // Fallback: open the latest couple of books (if any)
+    final recent = await listBooks(limit: 2, recent: true);
+    return recent.where((b) => b.sheetUrl.isNotEmpty).toList();
   }
 
   // ---------------- Helpers ----------------
