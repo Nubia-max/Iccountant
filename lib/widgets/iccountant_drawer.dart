@@ -1,18 +1,24 @@
 // lib/widgets/iccountant_drawer.dart
-// Dynamic drawer that lists Google Sheets “books” with a live mini preview.
-// On web: opens the Sheet in a NEW TAB. On mobile: shows an in-app WebView bottom sheet.
+// Responsive Iccountant drawer (top on mobile, sidebar on wide screens)
+// with a profile menu (Profile • Settings • Upgrade plan • Log out).
 
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 import 'package:taxpal/chatbot/service/ChatService.dart';
-import 'package:taxpal/widgets/google_sheet_view.dart'; // used on mobile only
+import 'package:taxpal/widgets/google_sheet_view.dart'; // mobile bottom-sheet viewer
+
+enum DrawerPlacement { top, side }
 
 class IccountantDrawer extends StatefulWidget {
-  const IccountantDrawer({super.key});
+  const IccountantDrawer({super.key, this.placement = DrawerPlacement.top});
 
+  final DrawerPlacement placement;
+
+  // Global helpers used by ChatScreen
   static final GlobalKey<_IccountantDrawerState> globalKey =
       GlobalKey<_IccountantDrawerState>();
 
@@ -35,8 +41,8 @@ class IccountantDrawer extends StatefulWidget {
 class _IccountantDrawerState extends State<IccountantDrawer> {
   final ChatService _svc = ChatService();
 
-  bool _open = false;
-  bool _loading = false; // lazy-load on first expand
+  bool _open = true; // open by default so users notice it
+  bool _loading = false;
   List<BookRef> _books = const [];
 
   Future<void> _loadBooks() async {
@@ -81,10 +87,8 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
     String sheetUrl,
   ) async {
     if (kIsWeb) {
-      // Web: open in a NEW TAB (never same tab)
       await launchUrl(Uri.parse(sheetUrl), webOnlyWindowName: '_blank');
     } else {
-      // Mobile/Desktop: keep your in-app WebView bottom sheet
       await showGoogleSheetBottomSheet(
         context,
         title: title,
@@ -93,107 +97,227 @@ class _IccountantDrawerState extends State<IccountantDrawer> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedContainer(
-      // key: const ValueKey('iccountant_drawer_box'),
-      duration: const Duration(milliseconds: 200),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border(
-          bottom: BorderSide(color: Colors.grey.withOpacity(0.25), width: 1),
+  // ----- UI bits -----
+
+  Widget _profileMenuButton() {
+    final u = FirebaseAuth.instance.currentUser;
+    final initials = _initialsFrom(u);
+    final tooltip = [
+      if ((u?.displayName ?? '').isNotEmpty) u!.displayName!,
+      if ((u?.email ?? '').isNotEmpty) u!.email!,
+    ].join('\n');
+
+    // Ensure a Material ancestor for Ink splashes and the popup.
+    return Material(
+      color: Colors.transparent,
+      child: PopupMenuButton<String>(
+        tooltip: 'Account',
+        offset: const Offset(0, 10),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        itemBuilder:
+            (context) => [
+              const PopupMenuItem(value: 'profile', child: Text('Profile')),
+              const PopupMenuItem(value: 'settings', child: Text('Settings')),
+              const PopupMenuItem(
+                value: 'upgrade',
+                child: Text('Upgrade plan'),
+              ),
+              const PopupMenuDivider(),
+              const PopupMenuItem(
+                value: 'logout',
+                child: Text('Log out', style: TextStyle(color: Colors.red)),
+              ),
+            ],
+        onSelected: (v) async {
+          switch (v) {
+            case 'logout':
+              await FirebaseAuth.instance.signOut();
+              break;
+            // Hook these up to your routes/screens later:
+            case 'profile':
+            case 'settings':
+            case 'upgrade':
+            default:
+              ScaffoldMessenger.of(
+                context,
+              ).showSnackBar(SnackBar(content: Text('$v coming soon')));
+          }
+        },
+        child: Tooltip(
+          message: tooltip.isEmpty ? 'Account' : tooltip,
+          preferBelow: false,
+          child: CircleAvatar(
+            radius: 16,
+            backgroundColor: Colors.black,
+            child: Text(
+              initials,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w700,
+                fontSize: 12,
+              ),
+            ),
+          ),
         ),
       ),
-      height: _open ? 420 : 60,
-      child: Column(
-        children: [
-          ListTile(
-            onTap: () async {
-              setState(() => _open = !_open);
-              if (_open && _books.isEmpty && !_loading) {
-                await _loadBooks();
-              }
-            },
-            title: Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                const Text('Iccountant', style: TextStyle(fontSize: 18)),
-                Icon(
-                  _open ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                ),
-              ],
+    );
+  }
+
+  String _initialsFrom(User? u) {
+    if (u == null) return 'U';
+    final basis =
+        (u.displayName?.trim().isNotEmpty == true)
+            ? u.displayName!.trim()
+            : (u.email ?? '').trim();
+    if (basis.isEmpty) return 'U';
+    var text = basis.contains('@') ? basis.split('@').first : basis;
+    text = text.replaceAll(RegExp(r'[^A-Za-z0-9]+'), ' ').trim();
+    if (text.isEmpty) return 'U';
+    final parts = text.split(RegExp(r'\s+'));
+    if (parts.length == 1) {
+      final s = parts.first.toUpperCase();
+      return s.length >= 2 ? s.substring(0, 2) : s;
+    }
+    final a = parts[0].isNotEmpty ? parts[0][0].toUpperCase() : '';
+    final b = parts[1].isNotEmpty ? parts[1][0].toUpperCase() : '';
+    final both = (a + b).trim();
+    return both.isEmpty ? 'U' : both;
+  }
+
+  Widget _headerBar() {
+    final isSide = widget.placement == DrawerPlacement.side;
+
+    // Wrap row in Material so PopupMenu/InkWell always have a Material ancestor.
+    return Material(
+      color: Colors.white,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(color: Colors.grey.withOpacity(0.25)),
+          ),
+        ),
+        child: Row(
+          children: [
+            IconButton(
+              icon: Icon(
+                _open ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+              ),
+              tooltip: _open ? 'Collapse' : 'Expand',
+              onPressed: () {
+                setState(() => _open = !_open);
+                if (_open && _books.isEmpty && !_loading) {
+                  _loadBooks();
+                }
+              },
             ),
-            trailing: IconButton(
+            const SizedBox(width: 4),
+            const Text(
+              'Iccountant',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+            const Spacer(),
+            IconButton(
               tooltip: 'Refresh',
               icon: const Icon(Icons.refresh),
               onPressed: _loadBooks,
             ),
-          ),
-          if (_open)
-            Expanded(
-              child:
-                  _loading
-                      ? const Center(
-                        child: Padding(
-                          padding: EdgeInsets.only(bottom: 16),
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                      )
-                      : _books.isEmpty
-                      ? const _EmptyBooks()
-                      : RefreshIndicator(
-                        onRefresh: _loadBooks,
-                        child: SingleChildScrollView(
-                          physics: const AlwaysScrollableScrollPhysics(),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 10,
-                            vertical: 6,
-                          ),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              const Padding(
-                                padding: EdgeInsets.symmetric(
-                                  horizontal: 6,
-                                  vertical: 6,
-                                ),
-                                child: Text(
-                                  'Books (Google Sheets)',
-                                  style: TextStyle(
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.black87,
-                                  ),
-                                ),
-                              ),
-                              GridView.builder(
-                                shrinkWrap: true,
-                                physics: const NeverScrollableScrollPhysics(),
-                                gridDelegate:
-                                    const SliverGridDelegateWithFixedCrossAxisCount(
-                                      crossAxisCount: 2,
-                                      mainAxisSpacing: 10,
-                                      crossAxisSpacing: 10,
-                                      childAspectRatio: 1.45,
-                                    ),
-                                itemCount: _books.length,
-                                itemBuilder:
-                                    (context, i) => _BookCard(
-                                      book: _books[i],
-                                      onOpen:
-                                          (bk) => _openSheet(
-                                            context,
-                                            bk.name,
-                                            bk.sheetUrl,
-                                          ),
-                                      svc: _svc,
-                                    ),
-                              ),
-                            ],
-                          ),
+            const SizedBox(width: 6),
+            _profileMenuButton(),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isSide = widget.placement == DrawerPlacement.side;
+
+    final listArea =
+        _loading
+            ? const Center(
+              child: Padding(
+                padding: EdgeInsets.only(bottom: 16),
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+            )
+            : _books.isEmpty
+            ? const _EmptyBooks()
+            : RefreshIndicator(
+              onRefresh: _loadBooks,
+              child: SingleChildScrollView(
+                physics: const AlwaysScrollableScrollPhysics(),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 6,
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Padding(
+                      padding: EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                      child: Text(
+                        'Books (Google Sheets)',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          color: Colors.black87,
                         ),
                       ),
-            ),
-        ],
+                    ),
+                    LayoutBuilder(
+                      builder: (context, c) {
+                        final cross =
+                            c.maxWidth >= 900
+                                ? 3
+                                : c.maxWidth >= 600
+                                ? 2
+                                : 2;
+                        return GridView.builder(
+                          shrinkWrap: true,
+                          physics: const NeverScrollableScrollPhysics(),
+                          gridDelegate:
+                              SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: cross,
+                                mainAxisSpacing: 10,
+                                crossAxisSpacing: 10,
+                                childAspectRatio: 1.45,
+                              ),
+                          itemCount: _books.length,
+                          itemBuilder:
+                              (context, i) => _BookCard(
+                                book: _books[i],
+                                onOpen:
+                                    (bk) => _openSheet(
+                                      context,
+                                      bk.name,
+                                      bk.sheetUrl,
+                                    ),
+                                svc: _svc,
+                              ),
+                        );
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            );
+
+    if (isSide) {
+      // Sidebar container
+      return Material(
+        color: Colors.white,
+        child: Column(children: [_headerBar(), Expanded(child: listArea)]),
+      );
+    }
+
+    // Top drawer container
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      height: _open ? 420 : 60,
+      decoration: const BoxDecoration(color: Colors.white),
+      child: Column(
+        children: [_headerBar(), if (_open) Expanded(child: listArea)],
       ),
     );
   }
@@ -236,8 +360,9 @@ class _BookCard extends StatelessWidget {
       subtitleParts.add('Updated ${_ago(book.updatedAt!)}');
     }
 
+    // Card itself supplies Material -> ink splashes are safe.
     return Card(
-      elevation: 0.3,
+      elevation: 0.6,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       color: Colors.grey.shade50,
       child: InkWell(

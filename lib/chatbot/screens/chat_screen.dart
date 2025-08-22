@@ -1,24 +1,23 @@
 // lib/chatbot/screens/chat_screen.dart
-// Chat UI + dynamic Iccountant drawer.
-// Flow: user sends → if /chat2 implies recording, show ephemeral "Recording…"
-//       → auto-open suggested Google Sheet books → then show assistant's reply.
+// World-class chat experience with “on-screen” AI replies (overlay card),
+// and a responsive Iccountant drawer that becomes a sidebar on large screens.
 
-import 'dart:io';
 import 'dart:async';
-import 'package:dash_chat_2/dash_chat_2.dart';
+import 'dart:typed_data';
+import 'dart:ui' show ImageFilter; // for BackdropFilter blur
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:unicons/unicons.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+
 import 'package:taxpal/services/google_connect_service.dart';
 import 'package:taxpal/chatbot/service/ChatService.dart';
 import 'package:taxpal/widgets/iccountant_drawer.dart';
 
-/// Same env var used elsewhere (main.dart, services, etc.)
+// Same env var used elsewhere
 const String API_BASE = String.fromEnvironment(
   'API_BASE',
   defaultValue: 'http://127.0.0.1:8000',
@@ -31,25 +30,29 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   // Services
   final ChatService _svc = ChatService(apiBase: API_BASE);
 
-  // Chat state
-  final List<ChatMessage> messages = [];
-  final ChatUser user = ChatUser(id: 'u', firstName: 'You');
-  final ChatUser bot = ChatUser(id: 'b', firstName: 'Iccountant');
-
-  // UI & voice
-  final TextEditingController inputCon = TextEditingController();
+  // Voice & images (kept for future expansion)
   final SpeechToText _speechToText = SpeechToText();
   final ImagePicker _picker = ImagePicker();
-  bool isListening = false;
+  final TextEditingController inputCon = TextEditingController();
 
-  // Pending images (local preview only)
+  bool isListening = false;
+  bool _loadingHistory = false;
   final List<XFile> _pendingImages = [];
 
-  bool _loadingHistory = false;
+  // “On-screen” reply overlay
+  String? _overlayText;
+  bool _overlayBusy = false; // for “Recording…” or ephemeral
+  late final AnimationController _overlayAnim = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 240),
+  );
+
+  // Minimal transcript chips (optional, light history)
+  final List<_ChipMsg> _chips = <_ChipMsg>[];
 
   @override
   void initState() {
@@ -59,19 +62,19 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadHistory();
   }
 
+  @override
+  void dispose() {
+    _overlayAnim.dispose();
+    super.dispose();
+  }
+
   Future<void> _autoConnectGoogleOnWeb() async {
     if (!kIsWeb) return;
-    const apiBase = API_BASE; // reuse your const
-    final svc = GoogleConnectService(baseUrl: apiBase);
-
-    // If not connected yet, kick off the OAuth popup once.
+    final svc = GoogleConnectService(baseUrl: API_BASE);
     final connected = await svc.status();
     if (!mounted || connected) return;
-
-    // Delay a tick to avoid layout jank, then start.
+    // Nudge once after a tiny delay
     await Future.delayed(const Duration(milliseconds: 250));
-    // Fire and forget; it will show a tiny popup once.
-    // After success, your /chat2 will be able to create Sheets.
     unawaited(svc.connect(context));
   }
 
@@ -86,137 +89,33 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // ------- Load chat history (newest first for DashChat)
   Future<void> _loadHistory() async {
+    // We keep history as tiny chips, not bubble UI
     setState(() => _loadingHistory = true);
     try {
       final convId = await _svc.ensureActiveConversation();
       final items = await _svc.fetchMessages(convId);
-      final converted =
+      final chips =
           items.map((m) {
-            final who = (m['role'] == 'user') ? user : bot;
-            final createdAt = DateTime.tryParse(
-              m['created_at']?.toString() ?? '',
-            );
-            return ChatMessage(
-              text: (m['content'] ?? '').toString(),
-              createdAt: createdAt ?? DateTime.now(),
-              user: who,
+            final role = (m['role'] ?? '').toString();
+            final text = (m['content'] ?? '').toString();
+            return _ChipMsg(
+              text: text,
+              fromUser: role == 'user',
+              when:
+                  DateTime.tryParse(m['created_at']?.toString() ?? '') ??
+                  DateTime.now(),
             );
           }).toList();
       setState(() {
-        messages
+        _chips
           ..clear()
-          ..addAll(converted.reversed);
+          ..addAll(chips.take(12).toList().reversed); // keep it light
       });
     } catch (_) {
       // ignore
     } finally {
       if (mounted) setState(() => _loadingHistory = false);
-    }
-  }
-
-  // ------- Chat send flow
-  Future<void> _handleSubmit() async {
-    final prompt = inputCon.text.trim();
-    final hasImages = _pendingImages.isNotEmpty; // reserved for future
-    final hasText = prompt.isNotEmpty;
-    if (!hasImages && !hasText) return;
-
-    // Show the user message immediately
-    final userMsg = ChatMessage(
-      text: prompt,
-      createdAt: DateTime.now(),
-      user: user,
-    );
-    messages.insert(0, userMsg);
-    setState(() {});
-    inputCon.clear();
-    _pendingImages.clear();
-
-    try {
-      final out = await _svc.chat2(prompt);
-      // after: final out = await _svc.chat2(prompt);
-      if (out.warnings.isNotEmpty) {
-        messages.insert(
-          0,
-          ChatMessage(
-            text: '⚠️ ${out.warnings.join('\n')}',
-            createdAt: DateTime.now(),
-            user: bot,
-          ),
-        );
-      }
-
-      if (out.warnings.isNotEmpty) {
-        debugPrint('Backend warnings: ${out.warnings}');
-        messages.insert(
-          0,
-          ChatMessage(
-            text: '⚠️ ${out.warnings.join('\n')}',
-            createdAt: DateTime.now(),
-            user: bot,
-          ),
-        );
-      }
-      debugPrint('posted_actions=${out.postedActions}');
-      debugPrint('open_books=${out.openBooks.map((b) => b.sheetUrl).toList()}');
-
-      final shouldShowRecording =
-          out.openBooks.isNotEmpty || out.postedActions.isNotEmpty;
-
-      if (shouldShowRecording) {
-        // 1) Show ephemeral "Recording…" (or server-provided text)
-        final temp = ChatMessage(
-          text:
-              out.ephemeralMessage?.isNotEmpty == true
-                  ? out.ephemeralMessage!
-                  : "Recording…",
-          createdAt: DateTime.now(),
-          user: bot,
-        );
-        messages.insert(0, temp);
-        setState(() {});
-
-        // 2) Open the suggested books sequentially as Sheets
-        await IccountantDrawer.openFromChat2(out);
-
-        // 3) Remove the ephemeral message if it's still visible
-        final idx = messages.indexOf(temp);
-        if (idx >= 0) {
-          messages.removeAt(idx);
-        }
-
-        // 4) Now show the assistant's normal reply
-        final reply = ChatMessage(
-          text:
-              out.assistantMessage.isNotEmpty ? out.assistantMessage : "Done.",
-          createdAt: DateTime.now(),
-          user: bot,
-        );
-        messages.insert(0, reply);
-        if (mounted) setState(() {});
-      } else {
-        // No recording; just show the normal reply immediately
-        final reply = ChatMessage(
-          text:
-              out.assistantMessage.isNotEmpty ? out.assistantMessage : "Done.",
-          createdAt: DateTime.now(),
-          user: bot,
-        );
-        messages.insert(0, reply);
-        setState(() {});
-      }
-    } catch (e) {
-      messages.insert(
-        0,
-        ChatMessage(
-          text: "Network error: $e",
-          createdAt: DateTime.now(),
-          user: bot,
-        ),
-      );
-      setState(() {});
     }
   }
 
@@ -248,6 +147,93 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  // ------- Send flow
+  Future<void> _handleSubmit() async {
+    final prompt = inputCon.text.trim();
+    final hasImages = _pendingImages.isNotEmpty; // reserved
+    if (prompt.isEmpty && !hasImages) return;
+
+    // Add tiny chip for the user's command (keeps the “no chatbox” vibe)
+    setState(() {
+      _chips.insert(
+        0,
+        _ChipMsg(text: prompt, fromUser: true, when: DateTime.now()),
+      );
+    });
+    inputCon.clear();
+    _pendingImages.clear();
+
+    try {
+      final out = await _svc.chat2(prompt);
+
+      // Show “Recording…” overlay while we open Sheets and do actions
+      final shouldShowRecording =
+          out.openBooks.isNotEmpty || out.postedActions.isNotEmpty;
+      if (shouldShowRecording) {
+        setState(() {
+          _overlayBusy = true;
+          _overlayText =
+              out.ephemeralMessage?.isNotEmpty == true
+                  ? out.ephemeralMessage
+                  : 'Recording…';
+        });
+        _overlayAnim.forward(from: 0);
+      }
+
+      // Open suggested books (thumbnails/values render in the drawer)
+      await IccountantDrawer.openFromChat2(out);
+
+      // Now show the final assistant reply as a large on-screen card
+      setState(() {
+        _overlayBusy = false;
+        _overlayText =
+            (out.assistantMessage.isNotEmpty ? out.assistantMessage : 'Done.');
+      });
+      _overlayAnim.forward(from: 0);
+
+      // Keep a tiny transcript chip for the bot too
+      setState(() {
+        _chips.insert(
+          0,
+          _ChipMsg(text: _overlayText!, fromUser: false, when: DateTime.now()),
+        );
+      });
+
+      // Auto-hide overlay after a few seconds (but leave chip transcript)
+      Future.delayed(const Duration(seconds: 8), () {
+        if (!mounted) return;
+        if (!_overlayBusy) {
+          setState(() => _overlayText = null);
+        }
+      });
+
+      // Warnings (if any) appear as a subtle footer chip
+      if (out.warnings.isNotEmpty) {
+        setState(() {
+          _chips.insert(
+            0,
+            _ChipMsg(
+              text: '⚠️ ${out.warnings.join('\n')}',
+              fromUser: false,
+              when: DateTime.now(),
+              toneWarning: true,
+            ),
+          );
+        });
+      }
+    } catch (e) {
+      setState(() {
+        _overlayBusy = false;
+        _overlayText = 'Network error: $e';
+      });
+      _overlayAnim.forward(from: 0);
+      Future.delayed(const Duration(seconds: 6), () {
+        if (!mounted) return;
+        if (!_overlayBusy) setState(() => _overlayText = null);
+      });
+    }
+  }
+
   // ------- Attachments preview row (images only, local)
   Widget _buildPendingPreviewRow() {
     if (_pendingImages.isEmpty) return const SizedBox.shrink();
@@ -264,12 +250,24 @@ class _ChatScreenState extends State<ChatScreen> {
             clipBehavior: Clip.none,
             children: [
               ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: Image.file(
-                  File(img.path),
-                  width: 70,
-                  height: 70,
-                  fit: BoxFit.cover,
+                borderRadius: BorderRadius.circular(10),
+                child: FutureBuilder<Uint8List>(
+                  future: img.readAsBytes(), // works on mobile & web
+                  builder: (context, snap) {
+                    if (!snap.hasData) {
+                      return Container(
+                        width: 76,
+                        height: 76,
+                        color: Colors.grey.shade300,
+                      );
+                    }
+                    return Image.memory(
+                      snap.data!,
+                      width: 76,
+                      height: 76,
+                      fit: BoxFit.cover,
+                    );
+                  },
                 ),
               ),
               Positioned(
@@ -301,98 +299,299 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  // ------- Build
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Column(
-        children: [
-          // Dynamic, Google-Sheets-powered drawer
-          IccountantDrawer(key: IccountantDrawer.globalKey),
-          Expanded(
-            child:
-                _loadingHistory
-                    ? const Center(
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                    : DashChat(
-                      currentUser: user,
-                      onSend: (_) {},
-                      readOnly: true,
-                      messages: messages,
-                    ),
-          ),
-          _buildPendingPreviewRow(),
-          _inputBar(),
-        ],
-      ),
-    );
-  }
-
-  Widget _inputBar() {
+  // ------- Command bar (no “chatbox”, a modern command palette)
+  Widget _commandBar() {
     final canSend =
         inputCon.text.trim().isNotEmpty || _pendingImages.isNotEmpty;
-    return Card(
-      color: Colors.white,
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-      margin: const EdgeInsets.all(10),
+
+    return SafeArea(
+      top: false,
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            IconButton(
-              icon: const Icon(Icons.attach_file_sharp, color: Colors.black),
-              onPressed: () async {
-                final result = await FilePicker.platform.pickFiles(
-                  allowMultiple: false,
-                );
-                if (result != null && result.files.isNotEmpty) {
-                  // Keep local preview simple for now
-                  setState(() {});
-                }
-              },
-            ),
-            Expanded(
-              child: TextField(
-                controller: inputCon,
-                maxLines: null,
-                minLines: 1,
-                keyboardType: TextInputType.multiline,
-                decoration: const InputDecoration(
-                  border: InputBorder.none,
-                  hintText:
-                      'Type here… e.g., “Sold goods ₦5,000 on credit to Tunde”',
+        padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+        child: Material(
+          // Give TextField/Buttons a proper Material ancestor
+          color: Colors.white.withOpacity(0.85),
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0x1A000000)), // subtle border
+          ),
+          clipBehavior: Clip.antiAlias,
+          child: Container(
+            // keep the soft shadow/aesthetic
+            decoration: const BoxDecoration(
+              boxShadow: [
+                BoxShadow(
+                  color: Color(0x14000000),
+                  blurRadius: 12,
+                  offset: Offset(0, 6),
                 ),
-                onChanged: (_) => setState(() {}),
-                onSubmitted: (_) => _handleSubmit(),
-              ),
+              ],
             ),
-            IconButton(
-              icon: Icon(
-                isListening ? UniconsLine.stop_circle : UniconsLine.microphone,
-                color: isListening ? Colors.red : Colors.black54,
-              ),
-              onPressed: _startListening,
-            ),
-            IconButton(
-              icon: Container(
-                decoration: BoxDecoration(
-                  color: canSend ? Colors.black : Colors.grey[300],
-                  shape: BoxShape.circle,
+            child: Row(
+              children: [
+                IconButton(
+                  tooltip: 'Attach',
+                  icon: const Icon(Icons.attach_file_outlined),
+                  onPressed: () async {
+                    final result = await FilePicker.platform.pickFiles(
+                      allowMultiple: false,
+                    );
+                    if (result != null && result.files.isNotEmpty) {
+                      setState(() {}); // preview handling stays the same
+                    }
+                  },
                 ),
-                padding: const EdgeInsets.all(8),
-                child: Icon(
-                  UniconsLine.arrow_up,
-                  color: canSend ? Colors.white : Colors.grey,
-                  size: 25,
+                Expanded(
+                  child: TextField(
+                    controller: inputCon,
+                    maxLines: 4,
+                    minLines: 1,
+                    keyboardType: TextInputType.multiline,
+                    decoration: const InputDecoration(
+                      border: InputBorder.none,
+                      hintText:
+                          'Ask anything… e.g. “Post ₦5,000 sales on credit to Tunde”',
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 2,
+                        vertical: 12,
+                      ),
+                    ),
+                    onChanged: (_) => setState(() {}),
+                    onSubmitted: (_) => _handleSubmit(),
+                  ),
                 ),
-              ),
-              onPressed: canSend ? _handleSubmit : null,
+                IconButton(
+                  tooltip: isListening ? 'Stop' : 'Voice',
+                  icon: Icon(
+                    isListening
+                        ? UniconsLine.stop_circle
+                        : UniconsLine.microphone,
+                  ),
+                  color: isListening ? Colors.red : Colors.black54,
+                  onPressed: _startListening,
+                ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      elevation: 0,
+                      backgroundColor:
+                          canSend ? Colors.black : Colors.grey[300],
+                      foregroundColor: canSend ? Colors.white : Colors.black54,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                    ),
+                    onPressed: canSend ? _handleSubmit : null,
+                    icon: const Icon(UniconsLine.arrow_up),
+                    label: const Text('Send'),
+                  ),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );
   }
+
+  Widget _overlayCard(String text, {bool busy = false}) {
+    return FadeTransition(
+      opacity: CurvedAnimation(parent: _overlayAnim, curve: Curves.easeOut),
+      child: Align(
+        alignment: Alignment.topCenter,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 24, 16, 0),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 980),
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+                child: Container(
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.85),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: Colors.black12),
+                    boxShadow: const [
+                      BoxShadow(
+                        color: Color(0x16000000),
+                        blurRadius: 18,
+                        offset: Offset(0, 12),
+                      ),
+                    ],
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Container(
+                        width: 34,
+                        height: 34,
+                        alignment: Alignment.center,
+                        margin: const EdgeInsets.only(right: 12, top: 2),
+                        decoration: const BoxDecoration(
+                          color: Colors.black,
+                          shape: BoxShape.circle,
+                        ),
+                        child: const Text(
+                          'AI',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.w700,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: Text(
+                          text,
+                          style: const TextStyle(fontSize: 16.5, height: 1.42),
+                        ),
+                      ),
+                      if (busy)
+                        const Padding(
+                          padding: EdgeInsets.only(left: 12, top: 4),
+                          child: SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _chipsTranscript() {
+    if (_chips.isEmpty) return const SizedBox.shrink();
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
+      child: Row(
+        children:
+            _chips.take(10).map((c) {
+              return Padding(
+                padding: const EdgeInsets.only(right: 8),
+                child: Chip(
+                  label: Text(
+                    c.text,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  backgroundColor:
+                      c.toneWarning
+                          ? const Color(0xFFFFF3CD)
+                          : (c.fromUser
+                              ? const Color(0xFFE8F0FE)
+                              : const Color(0xFFF6F6F6)),
+                  side: BorderSide(color: Colors.black12.withOpacity(0.6)),
+                ),
+              );
+            }).toList(),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      // <-- Provides the needed Material ancestor
+      backgroundColor: Colors.white,
+      body: LayoutBuilder(
+        builder: (ctx, c) {
+          final isWide = c.maxWidth >= 1100; // responsive switch
+
+          final content = Material(
+            color: Colors.transparent, // let gradient show
+            child: Stack(
+              children: [
+                // Soft gradient background
+                Container(
+                  decoration: const BoxDecoration(
+                    gradient: LinearGradient(
+                      colors: [Color(0xFFF9FBFF), Color(0xFFFDFDFD)],
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                    ),
+                  ),
+                ),
+                // Transcript chips row
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: _chipsTranscript(),
+                ),
+                // Optional image preview row
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 82 + MediaQuery.of(context).padding.bottom,
+                  child: _buildPendingPreviewRow(),
+                ),
+                // On-screen AI reply
+                if (_overlayText != null)
+                  _overlayCard(_overlayText!, busy: _overlayBusy),
+                // Command bar
+                Positioned(left: 0, right: 0, bottom: 0, child: _commandBar()),
+              ],
+            ),
+          );
+
+          if (isWide) {
+            // Sidebar mode
+            return Row(
+              children: [
+                SizedBox(
+                  width: 320,
+                  child: IccountantDrawer(
+                    key: IccountantDrawer.globalKey,
+                    placement: DrawerPlacement.side,
+                  ),
+                ),
+                const VerticalDivider(width: 1),
+                Expanded(child: content),
+              ],
+            );
+          }
+
+          // Top drawer mode (mobile / narrow)
+          return Column(
+            children: [
+              IccountantDrawer(
+                key: IccountantDrawer.globalKey,
+                placement: DrawerPlacement.top,
+              ),
+              const Divider(height: 1),
+              Expanded(child: content),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class _ChipMsg {
+  final String text;
+  final bool fromUser;
+  final DateTime when;
+  final bool toneWarning;
+  _ChipMsg({
+    required this.text,
+    required this.fromUser,
+    required this.when,
+    this.toneWarning = false,
+  });
 }

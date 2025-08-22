@@ -1,6 +1,6 @@
 // lib/chatbot/service/ChatService.dart
 // Service used by ChatScreen + IccountantDrawer.
-// - BookRef now includes sheetId
+// - BookRef includes sheetId
 // - Chat2Response.openBooks parsed with sheet_id
 // - listBooks() pulls dynamic list from backend
 // - booksToAutoOpen() chooses which to open after /chat2
@@ -256,7 +256,10 @@ class ChatService {
   }) async {
     final uri = Uri.parse('$_apiBase$_booksPath/$sheetId/thumbnail?w=$width');
     try {
-      final res = await http.get(uri, headers: await _authHeaders());
+      final res = await http.get(
+        uri,
+        headers: await _authHeaders(base: const {'Accept': '*/*'}),
+      );
       if (res.statusCode >= 200 && res.statusCode < 300) {
         return Uint8List.fromList(res.bodyBytes);
       }

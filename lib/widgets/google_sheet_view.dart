@@ -5,7 +5,6 @@
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
-// Only used on mobile platforms:
 import 'package:webview_flutter/webview_flutter.dart';
 
 Future<void> showGoogleSheetBottomSheet(
@@ -15,14 +14,13 @@ Future<void> showGoogleSheetBottomSheet(
 }) async {
   if (sheetUrl.isEmpty) return;
 
-  // --- WEB: open in a new tab (embedding is usually blocked by Google Docs) ---
+  // --- WEB: open in a new tab (embedding is often blocked by Google Docs) ---
   if (kIsWeb) {
-    // Will open _blank on web; on mobile/desktop it uses platform default.
     await launchUrl(Uri.parse(sheetUrl), webOnlyWindowName: '_blank');
     return;
   }
 
-  // --- MOBILE: show an in-app WebView in a bottom sheet ---
+  // --- MOBILE/DESKTOP: in-app WebView bottom sheet ---
   await showModalBottomSheet(
     context: context,
     isScrollControlled: true,
@@ -55,20 +53,18 @@ class _GoogleSheetWebViewState extends State<_GoogleSheetWebView> {
   @override
   void initState() {
     super.initState();
-
-    // WebViewController is only constructed on mobile (kIsWeb is false here).
-    final controller =
+    _ctrl =
         WebViewController()
           ..setJavaScriptMode(JavaScriptMode.unrestricted)
           ..setBackgroundColor(Colors.white)
           ..setNavigationDelegate(
             NavigationDelegate(
-              onProgress: (v) => setState(() => _progress = v / 100.0),
+              onProgress: (v) {
+                setState(() => _progress = v / 100.0);
+              },
             ),
           )
           ..loadRequest(Uri.parse(widget.sheetUrl));
-
-    _ctrl = controller;
   }
 
   @override
