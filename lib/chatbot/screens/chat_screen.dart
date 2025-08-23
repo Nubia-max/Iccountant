@@ -1,10 +1,12 @@
 // lib/chatbot/screens/chat_screen.dart
-// World-class chat experience with “on-screen” AI replies (overlay card),
-// and a responsive Iccountant drawer that becomes a sidebar on large screens.
+// Streaming overlay replies (WebSocket → SSE → HTTP), sticky until you tap outside,
+// thinking indicator, and AUTO-OPEN Sheets ONLY when the AI actually writes/updates a sheet.
+// The “Open sheets” pill has been removed.
 
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:ui' show ImageFilter; // for BackdropFilter blur
+import 'dart:ui' show ImageFilter;
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
@@ -17,7 +19,6 @@ import 'package:taxpal/services/google_connect_service.dart';
 import 'package:taxpal/chatbot/service/ChatService.dart';
 import 'package:taxpal/widgets/iccountant_drawer.dart';
 
-// Same env var used elsewhere
 const String API_BASE = String.fromEnvironment(
   'API_BASE',
   defaultValue: 'http://127.0.0.1:8000',
@@ -25,16 +26,13 @@ const String API_BASE = String.fromEnvironment(
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
-
   @override
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
 class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
-  // Services
   final ChatService _svc = ChatService(apiBase: API_BASE);
 
-  // Voice & images (kept for future expansion)
   final SpeechToText _speechToText = SpeechToText();
   final ImagePicker _picker = ImagePicker();
   final TextEditingController inputCon = TextEditingController();
@@ -43,15 +41,22 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   bool _loadingHistory = false;
   final List<XFile> _pendingImages = [];
 
-  // “On-screen” reply overlay
+  // Overlay state
   String? _overlayText;
-  bool _overlayBusy = false; // for “Recording…” or ephemeral
+  bool _overlayBusy = false;
+  bool _overlaySticky = false;
   late final AnimationController _overlayAnim = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 240),
+    duration: const Duration(milliseconds: 220),
   );
 
-  // Minimal transcript chips (optional, light history)
+  // Streaming subscription
+  StreamSubscription<ChatStreamEvent>? _streamSub;
+
+  // Auto-open guard per turn
+  bool _openedThisTurn = false;
+
+  // Chips transcript
   final List<_ChipMsg> _chips = <_ChipMsg>[];
 
   @override
@@ -64,6 +69,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _streamSub?.cancel();
     _overlayAnim.dispose();
     super.dispose();
   }
@@ -73,7 +79,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     final svc = GoogleConnectService(baseUrl: API_BASE);
     final connected = await svc.status();
     if (!mounted || connected) return;
-    // Nudge once after a tiny delay
     await Future.delayed(const Duration(milliseconds: 250));
     unawaited(svc.connect(context));
   }
@@ -90,7 +95,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _loadHistory() async {
-    // We keep history as tiny chips, not bubble UI
     setState(() => _loadingHistory = true);
     try {
       final convId = await _svc.ensureActiveConversation();
@@ -110,16 +114,31 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       setState(() {
         _chips
           ..clear()
-          ..addAll(chips.take(12).toList().reversed); // keep it light
+          ..addAll(chips.take(12).toList().reversed);
       });
-    } catch (_) {
-      // ignore
     } finally {
       if (mounted) setState(() => _loadingHistory = false);
     }
   }
 
-  // ------- Voice
+  void _showOverlay(String text, {bool busy = false, bool sticky = true}) {
+    setState(() {
+      _overlayText = text;
+      _overlayBusy = busy;
+      _overlaySticky = sticky;
+    });
+    _overlayAnim.forward(from: 0);
+  }
+
+  void _hideOverlay() {
+    if (_overlayBusy) return; // don't dismiss while streaming
+    setState(() {
+      _overlayText = null;
+      _overlaySticky = false;
+    });
+  }
+
+  // Voice
   Future<void> _startListening() async {
     if (isListening) {
       await _speechToText.stop();
@@ -138,22 +157,19 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   }
 
   void _onSpeechResult(SpeechRecognitionResult r) {
-    setState(() {
-      inputCon.text = r.recognizedWords;
-    });
+    setState(() => inputCon.text = r.recognizedWords);
     if (r.finalResult) {
       _speechToText.stop();
       setState(() => isListening = false);
     }
   }
 
-  // ------- Send flow
+  // Send (streaming via WS → SSE → HTTP)
   Future<void> _handleSubmit() async {
     final prompt = inputCon.text.trim();
-    final hasImages = _pendingImages.isNotEmpty; // reserved
+    final hasImages = _pendingImages.isNotEmpty;
     if (prompt.isEmpty && !hasImages) return;
 
-    // Add tiny chip for the user's command (keeps the “no chatbox” vibe)
     setState(() {
       _chips.insert(
         0,
@@ -163,78 +179,110 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     inputCon.clear();
     _pendingImages.clear();
 
-    try {
-      final out = await _svc.chat2(prompt);
+    // cancel any previous stream
+    await _streamSub?.cancel();
 
-      // Show “Recording…” overlay while we open Sheets and do actions
-      final shouldShowRecording =
-          out.openBooks.isNotEmpty || out.postedActions.isNotEmpty;
-      if (shouldShowRecording) {
-        setState(() {
-          _overlayBusy = true;
-          _overlayText =
-              out.ephemeralMessage?.isNotEmpty == true
-                  ? out.ephemeralMessage
-                  : 'Recording…';
-        });
-        _overlayAnim.forward(from: 0);
-      }
+    // reset per-turn open guard
+    _openedThisTurn = false;
 
-      // Open suggested books (thumbnails/values render in the drawer)
-      await IccountantDrawer.openFromChat2(out);
+    // show thinking
+    _showOverlay('Thinking…', busy: true, sticky: true);
 
-      // Now show the final assistant reply as a large on-screen card
-      setState(() {
-        _overlayBusy = false;
-        _overlayText =
-            (out.assistantMessage.isNotEmpty ? out.assistantMessage : 'Done.');
-      });
-      _overlayAnim.forward(from: 0);
+    _streamSub = _svc
+        .streamChat(prompt)
+        .listen(
+          (ev) async {
+            if (!mounted) return;
 
-      // Keep a tiny transcript chip for the bot too
-      setState(() {
-        _chips.insert(
-          0,
-          _ChipMsg(text: _overlayText!, fromUser: false, when: DateTime.now()),
+            if (ev.delta != null) {
+              final next =
+                  (_overlayText == null || _overlayText == 'Thinking…')
+                      ? ev.delta!
+                      : (_overlayText! + ev.delta!);
+              setState(() {
+                _overlayText = next;
+                _overlayBusy = true; // keep spinner during deltas
+              });
+              return;
+            }
+
+            if (ev.finalResponse != null) {
+              final out = ev.finalResponse!;
+              final reply =
+                  out.assistantMessage.isNotEmpty
+                      ? out.assistantMessage
+                      : 'Done.';
+
+              // UI update
+              setState(() {
+                if ((_overlayText ?? '').trim().isEmpty ||
+                    _overlayText == 'Thinking…') {
+                  _overlayText = reply;
+                }
+                _overlayBusy = false;
+                _overlaySticky = true;
+
+                _chips.insert(
+                  0,
+                  _ChipMsg(text: reply, fromUser: false, when: DateTime.now()),
+                );
+
+                if (out.warnings.isNotEmpty) {
+                  _chips.insert(
+                    0,
+                    _ChipMsg(
+                      text: '⚠️ ${out.warnings.join('\n')}',
+                      fromUser: false,
+                      when: DateTime.now(),
+                      toneWarning: true,
+                    ),
+                  );
+                }
+              });
+
+              // === AUTO-OPEN LOGIC ===
+              // Open exactly once per turn, only if the server says there are books to open.
+              if (!_openedThisTurn && out.openBooks.isNotEmpty) {
+                _openedThisTurn = true;
+
+                // Deduplicate by sheetUrl/sheetId defensively
+                final dedup = <String, BookRef>{};
+                for (final b in out.openBooks) {
+                  final key =
+                      (b.sheetId?.isNotEmpty == true ? b.sheetId! : b.sheetUrl);
+                  if (key.isEmpty) continue;
+                  dedup[key] = b;
+                }
+                final booksToOpen = dedup.values.toList();
+
+                if (booksToOpen.isNotEmpty) {
+                  final resp = Chat2Response(
+                    assistantMessage: out.assistantMessage,
+                    postedActions: out.postedActions,
+                    warnings: out.warnings,
+                    createdStatementIds: out.createdStatementIds,
+                    appendedJournalIds: out.appendedJournalIds,
+                    ephemeralMessage: out.ephemeralMessage,
+                    openBooks: booksToOpen,
+                  );
+                  await IccountantDrawer.openFromChat2(resp);
+                }
+              }
+              // === /AUTO-OPEN LOGIC ===
+            }
+          },
+          onError: (e) {
+            if (!mounted) return;
+            _showOverlay('Network error: $e', busy: false, sticky: true);
+          },
+          onDone: () {
+            if (!mounted) return;
+            setState(() => _overlayBusy = false);
+          },
         );
-      });
-
-      // Auto-hide overlay after a few seconds (but leave chip transcript)
-      Future.delayed(const Duration(seconds: 8), () {
-        if (!mounted) return;
-        if (!_overlayBusy) {
-          setState(() => _overlayText = null);
-        }
-      });
-
-      // Warnings (if any) appear as a subtle footer chip
-      if (out.warnings.isNotEmpty) {
-        setState(() {
-          _chips.insert(
-            0,
-            _ChipMsg(
-              text: '⚠️ ${out.warnings.join('\n')}',
-              fromUser: false,
-              when: DateTime.now(),
-              toneWarning: true,
-            ),
-          );
-        });
-      }
-    } catch (e) {
-      setState(() {
-        _overlayBusy = false;
-        _overlayText = 'Network error: $e';
-      });
-      _overlayAnim.forward(from: 0);
-      Future.delayed(const Duration(seconds: 6), () {
-        if (!mounted) return;
-        if (!_overlayBusy) setState(() => _overlayText = null);
-      });
-    }
   }
 
-  // ------- Attachments preview row (images only, local)
+  // Attachments preview row
   Widget _buildPendingPreviewRow() {
     if (_pendingImages.isEmpty) return const SizedBox.shrink();
     return SizedBox(
@@ -246,60 +294,33 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
         separatorBuilder: (_, __) => const SizedBox(width: 8),
         itemBuilder: (context, i) {
           final img = _pendingImages[i];
-          return Stack(
-            clipBehavior: Clip.none,
-            children: [
-              ClipRRect(
-                borderRadius: BorderRadius.circular(10),
-                child: FutureBuilder<Uint8List>(
-                  future: img.readAsBytes(), // works on mobile & web
-                  builder: (context, snap) {
-                    if (!snap.hasData) {
-                      return Container(
-                        width: 76,
-                        height: 76,
-                        color: Colors.grey.shade300,
-                      );
-                    }
-                    return Image.memory(
-                      snap.data!,
-                      width: 76,
-                      height: 76,
-                      fit: BoxFit.cover,
-                    );
-                  },
-                ),
-              ),
-              Positioned(
-                top: -6,
-                right: -6,
-                child: GestureDetector(
-                  onTap: () {
-                    _pendingImages.removeAt(i);
-                    setState(() {});
-                  },
-                  child: Container(
-                    padding: const EdgeInsets.all(2),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.7),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.close,
-                      size: 16,
-                      color: Colors.white,
-                    ),
-                  ),
-                ),
-              ),
-            ],
+          return ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: FutureBuilder<Uint8List>(
+              future: img.readAsBytes(),
+              builder: (context, snap) {
+                if (!snap.hasData) {
+                  return Container(
+                    width: 76,
+                    height: 76,
+                    color: Colors.grey.shade300,
+                  );
+                }
+                return Image.memory(
+                  snap.data!,
+                  width: 76,
+                  height: 76,
+                  fit: BoxFit.cover,
+                );
+              },
+            ),
           );
         },
       ),
     );
   }
 
-  // ------- Command bar (no “chatbox”, a modern command palette)
+  // Command bar
   Widget _commandBar() {
     final canSend =
         inputCon.text.trim().isNotEmpty || _pendingImages.isNotEmpty;
@@ -309,16 +330,14 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       child: Padding(
         padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
         child: Material(
-          // Give TextField/Buttons a proper Material ancestor
           color: Colors.white.withOpacity(0.85),
           elevation: 0,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
-            side: const BorderSide(color: Color(0x1A000000)), // subtle border
+            side: const BorderSide(color: Color(0x1A000000)),
           ),
           clipBehavior: Clip.antiAlias,
           child: Container(
-            // keep the soft shadow/aesthetic
             decoration: const BoxDecoration(
               boxShadow: [
                 BoxShadow(
@@ -338,7 +357,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                       allowMultiple: false,
                     );
                     if (result != null && result.files.isNotEmpty) {
-                      setState(() {}); // preview handling stays the same
+                      setState(() {}); // local preview only
                     }
                   },
                 ),
@@ -350,8 +369,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                     keyboardType: TextInputType.multiline,
                     decoration: const InputDecoration(
                       border: InputBorder.none,
-                      hintText:
-                          'Ask anything… e.g. “Post ₦5,000 sales on credit to Tunde”',
+                      hintText: 'Ask Iccountant',
                       contentPadding: EdgeInsets.symmetric(
                         horizontal: 2,
                         vertical: 12,
@@ -400,7 +418,9 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
-  Widget _overlayCard(String text, {bool busy = false}) {
+  // Dismissable, scrollable overlay card
+  Widget _overlayCard(BuildContext context, String text, {bool busy = false}) {
+    final maxH = MediaQuery.of(context).size.height * 0.65;
     return FadeTransition(
       opacity: CurvedAnimation(parent: _overlayAnim, curve: Curves.easeOut),
       child: Align(
@@ -413,56 +433,67 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
               borderRadius: BorderRadius.circular(16),
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
-                child: Container(
-                  padding: const EdgeInsets.all(20),
-                  decoration: BoxDecoration(
-                    color: Colors.white.withOpacity(0.85),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: Colors.black12),
-                    boxShadow: const [
-                      BoxShadow(
-                        color: Color(0x16000000),
-                        blurRadius: 18,
-                        offset: Offset(0, 12),
-                      ),
-                    ],
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        width: 34,
-                        height: 34,
-                        alignment: Alignment.center,
-                        margin: const EdgeInsets.only(right: 12, top: 2),
-                        decoration: const BoxDecoration(
-                          color: Colors.black,
-                          shape: BoxShape.circle,
+                child: Material(
+                  color: Colors.white.withOpacity(0.9),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Colors.black12),
+                      boxShadow: const [
+                        BoxShadow(
+                          color: Color(0x16000000),
+                          blurRadius: 18,
+                          offset: Offset(0, 12),
                         ),
-                        child: const Text(
-                          'AI',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
+                      ],
+                    ),
+                    padding: const EdgeInsets.all(20),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          width: 34,
+                          height: 34,
+                          alignment: Alignment.center,
+                          margin: const EdgeInsets.only(right: 12, top: 2),
+                          decoration: const BoxDecoration(
+                            color: Colors.black,
+                            shape: BoxShape.circle,
+                          ),
+                          child: const Text(
+                            'AI',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w700,
+                            ),
                           ),
                         ),
-                      ),
-                      Expanded(
-                        child: Text(
-                          text,
-                          style: const TextStyle(fontSize: 16.5, height: 1.42),
-                        ),
-                      ),
-                      if (busy)
-                        const Padding(
-                          padding: EdgeInsets.only(left: 12, top: 4),
-                          child: SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
+                        Expanded(
+                          child: ConstrainedBox(
+                            constraints: BoxConstraints(maxHeight: maxH),
+                            child: SingleChildScrollView(
+                              padding: const EdgeInsets.only(right: 4),
+                              child: Text(
+                                text,
+                                style: const TextStyle(
+                                  fontSize: 16.5,
+                                  height: 1.42,
+                                ),
+                              ),
+                            ),
                           ),
                         ),
-                    ],
+                        if (busy)
+                          const Padding(
+                            padding: EdgeInsets.only(left: 12, top: 4),
+                            child: SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -473,6 +504,7 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
     );
   }
 
+  // Chips — tap to view full message
   Widget _chipsTranscript() {
     if (_chips.isEmpty) return const SizedBox.shrink();
     return SingleChildScrollView(
@@ -481,21 +513,24 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
       child: Row(
         children:
             _chips.take(10).map((c) {
+              final bg =
+                  c.toneWarning
+                      ? const Color(0xFFFFF3CD)
+                      : (c.fromUser
+                          ? const Color(0xFFE8F0FE)
+                          : const Color(0xFFF6F6F6));
               return Padding(
                 padding: const EdgeInsets.only(right: 8),
-                child: Chip(
+                child: ActionChip(
                   label: Text(
                     c.text,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
-                  backgroundColor:
-                      c.toneWarning
-                          ? const Color(0xFFFFF3CD)
-                          : (c.fromUser
-                              ? const Color(0xFFE8F0FE)
-                              : const Color(0xFFF6F6F6)),
+                  backgroundColor: bg,
                   side: BorderSide(color: Colors.black12.withOpacity(0.6)),
+                  onPressed:
+                      () => _showOverlay(c.text, busy: false, sticky: true),
                 ),
               );
             }).toList(),
@@ -506,17 +541,16 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      // <-- Provides the needed Material ancestor
       backgroundColor: Colors.white,
       body: LayoutBuilder(
         builder: (ctx, c) {
-          final isWide = c.maxWidth >= 1100; // responsive switch
+          final isWide = c.maxWidth >= 1100;
 
           final content = Material(
-            color: Colors.transparent, // let gradient show
+            color: Colors.transparent,
             child: Stack(
               children: [
-                // Soft gradient background
+                // Background gradient
                 Container(
                   decoration: const BoxDecoration(
                     gradient: LinearGradient(
@@ -526,23 +560,32 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
                     ),
                   ),
                 ),
-                // Transcript chips row
+                // Chips
                 Positioned(
                   top: 0,
                   left: 0,
                   right: 0,
                   child: _chipsTranscript(),
                 ),
-                // Optional image preview row
+                // Pending preview
                 Positioned(
                   left: 0,
                   right: 0,
                   bottom: 82 + MediaQuery.of(context).padding.bottom,
                   child: _buildPendingPreviewRow(),
                 ),
-                // On-screen AI reply
+                // Tap-anywhere-to-dismiss (only when sticky)
+                if (_overlayText != null && _overlaySticky)
+                  Positioned.fill(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.translucent,
+                      onTap: _hideOverlay,
+                      child: const SizedBox.expand(),
+                    ),
+                  ),
+                // Overlay card
                 if (_overlayText != null)
-                  _overlayCard(_overlayText!, busy: _overlayBusy),
+                  _overlayCard(context, _overlayText!, busy: _overlayBusy),
                 // Command bar
                 Positioned(left: 0, right: 0, bottom: 0, child: _commandBar()),
               ],
@@ -550,7 +593,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
           );
 
           if (isWide) {
-            // Sidebar mode
             return Row(
               children: [
                 SizedBox(
@@ -566,7 +608,6 @@ class _ChatScreenState extends State<ChatScreen> with TickerProviderStateMixin {
             );
           }
 
-          // Top drawer mode (mobile / narrow)
           return Column(
             children: [
               IccountantDrawer(

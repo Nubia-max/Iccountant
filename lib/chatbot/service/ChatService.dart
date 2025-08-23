@@ -1,16 +1,16 @@
 // lib/chatbot/service/ChatService.dart
-// Service used by ChatScreen + IccountantDrawer.
-// - BookRef includes sheetId
-// - Chat2Response.openBooks parsed with sheet_id
-// - listBooks() pulls dynamic list from backend
-// - booksToAutoOpen() chooses which to open after /chat2
-// - fetchBookThumbnail()/fetchBookValues() power drawer previews
+// Chat + Books service with WebSocket streaming (primary) and SSE (fallback).
+// - streamChat(): tries WS → SSE → one-shot HTTP
+// - SSE parsing fixed: only the top-level async* uses `yield`.
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
+
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:firebase_auth/firebase_auth.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 const String _API_BASE = String.fromEnvironment(
   'API_BASE',
@@ -20,8 +20,8 @@ const String _API_BASE = String.fromEnvironment(
 class BookRef {
   final String name;
   final String sheetUrl; // full Google Sheets URL
-  final String sheetId; // fileId for previews (thumbnail/values)
-  final String? kind; // e.g. "journal", "ledger", etc.
+  final String sheetId; // Drive fileId
+  final String? kind; // "journal", "ledger", "sofp", "sopl", etc.
   final DateTime? updatedAt;
 
   BookRef({
@@ -54,6 +54,21 @@ class BookRef {
       updatedAt: _parseDt(m['updated_at']),
     );
   }
+
+  /// UI-friendly label when Drive name is "grid" or empty
+  String get displayName {
+    final raw = (name).trim().toLowerCase();
+    if (raw.isEmpty || raw == 'grid') {
+      final k = (kind ?? '').toLowerCase();
+      if (k.contains('sofp')) return 'Statement of Financial Position';
+      if (k.contains('sopl') || k.contains('p&l') || k.contains('pl')) {
+        return 'Profit & Loss';
+      }
+      if (k.contains('ledger') || k.contains('journal')) return 'Ledger';
+      return 'Sheet';
+    }
+    return name;
+  }
 }
 
 class Chat2Response {
@@ -63,8 +78,6 @@ class Chat2Response {
   final List<int> createdStatementIds;
   final List<int> appendedJournalIds;
   final String? ephemeralMessage;
-
-  /// Dynamic books the assistant suggests opening (Google Sheets).
   final List<BookRef> openBooks;
 
   Chat2Response({
@@ -109,6 +122,17 @@ class Chat2Response {
   }
 }
 
+/// Streaming event for WS/SSE
+class ChatStreamEvent {
+  final String? delta; // incremental text
+  final Chat2Response? finalResponse; // final payload
+  final bool done; // stream done
+
+  ChatStreamEvent.delta(this.delta) : finalResponse = null, done = false;
+  ChatStreamEvent.finalized(this.finalResponse) : delta = null, done = true;
+  ChatStreamEvent.done() : delta = null, finalResponse = null, done = true;
+}
+
 class ChatService {
   ChatService({String? apiBase})
     : _apiBase = (apiBase == null || apiBase.isEmpty) ? _API_BASE : apiBase;
@@ -117,12 +141,13 @@ class ChatService {
 
   // Endpoints
   static const _chat2 = '/chat2';
+  static const _chat2Sse = '/chat2/stream';
+  static const _chat2Ws = '/chat2/ws';
   static const _messagesPath = '/messages';
   static const _booksPath = '/books';
 
   // ---------------- Auth helpers ----------------
   Future<String?> _freshIdToken() async {
-    // Force refresh to avoid stale token right after sign up
     return FirebaseAuth.instance.currentUser?.getIdToken(true);
   }
 
@@ -137,6 +162,15 @@ class ChatService {
     return h;
   }
 
+  Future<Map<String, String>> _authHeadersSse() async {
+    final tok = await _freshIdToken();
+    return {
+      'Content-Type': 'application/json',
+      'Accept': 'text/event-stream',
+      if (tok != null && tok.isNotEmpty) 'Authorization': 'Bearer $tok',
+    };
+  }
+
   // ---------------- Conversation id ----------------
   Future<String> ensureActiveConversation() async {
     final prefs = await SharedPreferences.getInstance();
@@ -146,7 +180,7 @@ class ChatService {
     return id;
   }
 
-  // ---------------- Chat ----------------
+  // ---------------- Chat (non-streaming) ----------------
   Future<Chat2Response> chat2(String input) async {
     final convId = await ensureActiveConversation();
     final uri = Uri.parse('$_apiBase$_chat2');
@@ -162,7 +196,6 @@ class ChatService {
       return Chat2Response.fromJson(_safeJson(res.body));
     }
 
-    // Shape errors into a consistent response
     if (res.statusCode == 401) {
       return Chat2Response(
         assistantMessage: 'You are not signed in. Please login again.',
@@ -199,6 +232,226 @@ class ChatService {
     );
   }
 
+  // ---------------- Chat (WebSocket preferred) ----------------
+  /// High-level convenience: tries WS → SSE → one-shot HTTP
+  Stream<ChatStreamEvent> streamChat(String input) async* {
+    // 1) Try WebSocket
+    try {
+      yield* _streamChatWebSocket(input);
+      return;
+    } catch (_) {
+      // ignore, fallback to SSE
+    }
+    // 2) Try SSE
+    try {
+      yield* _streamChatSse(input);
+      return;
+    } catch (_) {
+      // ignore, fallback to one-shot
+    }
+    // 3) One-shot
+    final once = await chat2(input);
+    yield ChatStreamEvent.finalized(once);
+  }
+
+  Uri _toWsUri(String path, Map<String, String> query) {
+    final base = Uri.parse(_apiBase);
+    final scheme = base.scheme == 'https' ? 'wss' : 'ws';
+    final full = base.replace(
+      scheme: scheme,
+      path: path,
+      queryParameters: query,
+    );
+    return full;
+  }
+
+  Stream<ChatStreamEvent> _streamChatWebSocket(String input) async* {
+    final convId = await ensureActiveConversation();
+    final tok = await _freshIdToken();
+
+    // On web, you can't send custom headers — so pass token in query params.
+    final wsUri = _toWsUri(_chat2Ws, {
+      'conversation_id': convId,
+      if (tok != null && tok.isNotEmpty) 'token': tok,
+      'stream': 'true',
+    });
+
+    final channel = WebSocketChannel.connect(wsUri);
+
+    // Send initial payload too (some servers rely on message body)
+    channel.sink.add(
+      jsonEncode({
+        'conversation_id': convId,
+        'message': input,
+        'stream': true,
+        if (tok != null && tok.isNotEmpty) 'token': tok,
+      }),
+    );
+
+    try {
+      await for (final msg in channel.stream) {
+        if (msg == null) continue;
+        Map<String, dynamic>? j;
+        try {
+          j = jsonDecode(msg as String) as Map<String, dynamic>;
+        } catch (_) {
+          // treat as plain delta
+          if (msg is String && msg.isNotEmpty) {
+            yield ChatStreamEvent.delta(msg);
+          }
+          continue;
+        }
+
+        final ev = (j['event'] ?? j['type'] ?? '').toString().toLowerCase();
+        if (ev == 'delta') {
+          final d = j['delta']?.toString() ?? '';
+          if (d.isNotEmpty) yield ChatStreamEvent.delta(d);
+          continue;
+        }
+        if (ev == 'final' ||
+            j.containsKey('assistant_message') ||
+            j.containsKey('open_books')) {
+          yield ChatStreamEvent.finalized(Chat2Response.fromJson(j));
+          continue;
+        }
+        if (ev == 'done') {
+          yield ChatStreamEvent.done();
+          break;
+        }
+
+        // Unknown -> try delta
+        final d = j['delta']?.toString();
+        if (d != null && d.isNotEmpty) {
+          yield ChatStreamEvent.delta(d);
+        }
+      }
+    } finally {
+      await channel.sink.close();
+    }
+  }
+
+  // ---------------- Chat (SSE fallback) ----------------
+  Stream<ChatStreamEvent> _streamChatSse(String input) async* {
+    final convId = await ensureActiveConversation();
+    final uri = Uri.parse('$_apiBase$_chat2Sse');
+
+    final client = http.Client();
+    late http.StreamedResponse streamed;
+    try {
+      final req = http.Request('POST', uri);
+      req.headers.addAll(await _authHeadersSse());
+      req.body = jsonEncode({
+        'conversation_id': convId,
+        'message': input,
+        'stream': true,
+      });
+
+      streamed = await client.send(req);
+      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+        final fallback = await chat2(input);
+        yield ChatStreamEvent.finalized(fallback);
+        return;
+      }
+
+      final utf8Stream = streamed.stream.transform(utf8.decoder);
+      final lines = utf8Stream.transform(const LineSplitter());
+
+      String? eventName;
+      final dataBuf = StringBuffer();
+
+      List<ChatStreamEvent> _buildEvents(String? evName, String data) {
+        final List<ChatStreamEvent> out = [];
+        final ev = (evName ?? 'message').trim();
+        if (data.isEmpty) return out;
+
+        Map<String, dynamic>? jsonData;
+        try {
+          jsonData = jsonDecode(data) as Map<String, dynamic>;
+        } catch (_) {
+          jsonData = null;
+        }
+
+        if (ev == 'delta') {
+          final text =
+              jsonData == null ? data : (jsonData['delta']?.toString() ?? '');
+          if (text.isNotEmpty) out.add(ChatStreamEvent.delta(text));
+          return out;
+        }
+        if (ev == 'final') {
+          if (jsonData != null) {
+            out.add(
+              ChatStreamEvent.finalized(Chat2Response.fromJson(jsonData)),
+            );
+          } else {
+            out.add(
+              ChatStreamEvent.finalized(
+                Chat2Response(
+                  assistantMessage: data,
+                  postedActions: const [],
+                  warnings: const [],
+                  createdStatementIds: const [],
+                  appendedJournalIds: const [],
+                  ephemeralMessage: null,
+                  openBooks: const [],
+                ),
+              ),
+            );
+          }
+          return out;
+        }
+        if (ev == 'done') {
+          out.add(ChatStreamEvent.done());
+          return out;
+        }
+
+        // Heuristics if event name not provided
+        if (jsonData != null) {
+          if (jsonData.containsKey('assistant_message') ||
+              jsonData.containsKey('open_books')) {
+            out.add(
+              ChatStreamEvent.finalized(Chat2Response.fromJson(jsonData)),
+            );
+          } else {
+            final d = jsonData['delta']?.toString();
+            if (d != null && d.isNotEmpty) out.add(ChatStreamEvent.delta(d));
+          }
+        } else if (data.isNotEmpty) {
+          out.add(ChatStreamEvent.delta(data));
+        }
+        return out;
+      }
+
+      List<ChatStreamEvent> _drainBuffer() {
+        final data = dataBuf.toString().trim();
+        dataBuf.clear();
+        final events = _buildEvents(eventName, data);
+        eventName = null;
+        return events;
+      }
+
+      await for (final line in lines) {
+        if (line.startsWith('event:')) {
+          eventName = line.substring(6).trim();
+        } else if (line.startsWith('data:')) {
+          dataBuf.writeln(line.substring(5));
+        } else if (line.trim().isEmpty) {
+          final evs = _drainBuffer();
+          for (final e in evs) {
+            yield e; // <— top-level yield (legal)
+          }
+        }
+      }
+      // flush tail if any
+      final tail = _drainBuffer();
+      for (final e in tail) {
+        yield e; // <— top-level yield (legal)
+      }
+    } finally {
+      client.close();
+    }
+  }
+
+  // ---------------- Messages history ----------------
   Future<List<Map<String, dynamic>>> fetchMessages(
     String conversationId,
   ) async {
@@ -217,7 +470,7 @@ class ChatService {
     return <Map<String, dynamic>>[];
   }
 
-  // ---------------- Dynamic books ----------------
+  // ---------------- Books ----------------
   Future<List<BookRef>> listBooks({int limit = 50, bool recent = true}) async {
     final qp = <String, String>{'limit': '$limit'};
     if (recent) qp['recent'] = 'true';
@@ -235,31 +488,22 @@ class ChatService {
     return const <BookRef>[];
   }
 
-  /// Decide which books to open after /chat2:
-  /// 1) Prefer explicit `open_books` from chat2
-  /// 2) Else, fallback to a couple of recent books
   Future<List<BookRef>> booksToAutoOpen(Chat2Response out) async {
     if (out.openBooks.isNotEmpty) {
       return out.openBooks.where((b) => b.sheetUrl.isNotEmpty).toList();
     }
-    // Fallback: open the latest couple of books (if any)
     final recent = await listBooks(limit: 2, recent: true);
     return recent.where((b) => b.sheetUrl.isNotEmpty).toList();
   }
 
-  // ---------------- Preview helpers (for drawer) ----------------
-
-  /// Returns a JPEG/PNG thumbnail (or null if Drive has none).
+  // ---------------- Previews ----------------
   Future<Uint8List?> fetchBookThumbnail(
     String sheetId, {
     int width = 640,
   }) async {
     final uri = Uri.parse('$_apiBase$_booksPath/$sheetId/thumbnail?w=$width');
     try {
-      final res = await http.get(
-        uri,
-        headers: await _authHeaders(base: const {'Accept': '*/*'}),
-      );
+      final res = await http.get(uri, headers: await _authHeaders());
       if (res.statusCode >= 200 && res.statusCode < 300) {
         return Uint8List.fromList(res.bodyBytes);
       }
@@ -267,7 +511,6 @@ class ChatService {
     return null;
   }
 
-  /// Returns a tiny grid of cell values for preview (A1:F12 by default).
   Future<List<List<String>>> fetchBookValues(
     String sheetId, {
     String range = 'A1:F12',
